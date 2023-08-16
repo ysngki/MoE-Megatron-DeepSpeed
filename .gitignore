@@ -21,3 +21,7 @@ logs
 
 # Data folder
 bookcorpus_data/
+
+yyh_config/
+log/
+checkpoint/

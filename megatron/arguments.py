@@ -284,6 +284,9 @@ def validate_args(args, defaults={}):
         else:
             args.ffn_hidden_size = 4 * args.hidden_size
 
+    if args.moe_ffn_hidden_size is None:
+        args.moe_ffn_hidden_size = args.ffn_hidden_size
+
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
@@ -592,6 +595,8 @@ def _add_network_size_args(parser):
                            help='Only applicable when num-experts > 1, accepts [standard, residual]')
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
+    group.add_argument('--threshold', type=float, default=-1.0,
+                           help='MoE Treshold')
     group.add_argument('--expert-interval', type=int, default=2,
                            help='Use experts in every "expert-interval" layers')
     group.add_argument('--hidden-size', type=int, default=None,
@@ -599,7 +604,12 @@ def _add_network_size_args(parser):
     group.add_argument('--ffn-hidden-size', type=int, default=None,
                        help='Transformer Feed-Forward Network hidden size. '
                        'This is set to 4*hidden-size if not provided')
+    group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
+                       help='MoE Layer\'s Feed-Forward Network hidden size. '
+                       'This is set to ffn-hidden-size if not provided')
     group.add_argument('--num-attention-heads', type=int, default=None,
+                       help='Number of transformer attention heads.')
+    group.add_argument('--num-ffn-heads', type=int, default=1,
                        help='Number of transformer attention heads.')
     group.add_argument('--num-key-value-heads', type=int, default=None,
                        help='Number of key_value heads that should be used to implement Grouped Query Attention.')
@@ -1157,6 +1167,9 @@ def _add_validation_args(parser):
     group = parser.add_argument_group(title='validation')
 
     group.add_argument('--eval-iters', type=int, default=100,
+                       help='Number of iterations to run for evaluation'
+                       'validation/test for.')
+    group.add_argument('--test-iters', type=int, default=100,
                        help='Number of iterations to run for evaluation'
                        'validation/test for.')
     group.add_argument('--eval-interval', type=int, default=1000,

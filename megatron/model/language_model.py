@@ -512,6 +512,8 @@ class TransformerLanguageModel(MegatronModule):
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
 
+        my_probe = {}
+
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
@@ -539,7 +541,7 @@ class TransformerLanguageModel(MegatronModule):
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
-                encoder_output, *encoder_moe_losses = self.encoder(
+                encoder_output, my_probe, *encoder_moe_losses = self.encoder(
                     encoder_input,
                     enc_attn_mask,
                     retriever_input=retriever_input,
@@ -563,7 +565,7 @@ class TransformerLanguageModel(MegatronModule):
             if self.add_pooler and self.post_process:
                 return encoder_output, pooled_output, encoder_moe_losses
             else:
-                return encoder_output, encoder_moe_losses
+                return encoder_output, my_probe, encoder_moe_losses
 
         # Decoder embedding.
         if self.pre_process:

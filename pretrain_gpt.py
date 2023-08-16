@@ -42,6 +42,7 @@ def model_provider(pre_process=True, post_process=True):
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
+            raise Exception("honoka here!!!")
             model = GPTModelPipe(
                 config=config,
                 num_tokentypes=0,
@@ -277,7 +278,7 @@ def forward_step(data_iterator, model):
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         output_tensor = tensor_parallel.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
     else:
-        output_tensor, other_losses = model(tokens, position_ids, attention_mask,
+        output_tensor, my_probe, other_losses = model(tokens, position_ids, attention_mask,
                                             labels=labels)
     if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
@@ -296,7 +297,7 @@ def forward_step(data_iterator, model):
                 args.teacher_model[0], tokens, position_ids, attention_mask)
 
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
-    return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
+    return output_tensor, my_probe, partial(loss_func, loss_mask, moe_loss, mos_loss)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

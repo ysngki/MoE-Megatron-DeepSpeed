@@ -110,15 +110,20 @@ class ParallelMLP(MegatronModule):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
+        in_hidden_size = args.hidden_size
+        ffn_hidden_size = args.ffn_hidden_size
+        if moe:
+            in_hidden_size = args.hidden_size // args.num_ffn_heads
+            ffn_hidden_size = args.moe_ffn_hidden_size
+
         self.add_bias = config.add_bias_linear
 
-        ffn_hidden_size = config.ffn_hidden_size
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            config.hidden_size,
+            in_hidden_size,
             ffn_hidden_size,
             config=config,
             init_method=config.init_method,
@@ -152,8 +157,8 @@ class ParallelMLP(MegatronModule):
 
         # Project back to h.
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
-            config.ffn_hidden_size,
-            config.hidden_size,
+            ffn_hidden_size,
+            in_hidden_size,
             config=config,
             init_method=config.output_layer_init_method,
             bias=self.add_bias,
@@ -162,6 +167,9 @@ class ParallelMLP(MegatronModule):
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
 
+    def get_key_weight(self):
+        return self.dense_h_to_4h.weight.mean(dim=0, keepdim=True)  # (1, input_dim)
+    
     def forward(self, hidden_states):
 
         # [s, b, 4hp]
@@ -177,9 +185,12 @@ class ParallelMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
 
+        non_zero_ratio = (intermediate_parallel.view(-1) > 0).float().mean(dim=-1)
+        # intermediate_parallel = F.softmax(intermediate_parallel, dim=-1)
+
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
-        return output, output_bias
+        return output, output_bias, non_zero_ratio
 
 class SwitchMLP(MegatronModule):
     """
@@ -989,7 +1000,8 @@ class ParallelTransformerLayer(MegatronModule):
                                 eval_capacity_factor=args.moe_eval_capacity_factor,
                                 min_capacity=args.moe_min_capacity,
                                 drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
-                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
+                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
+                                threshold=args.threshold)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -1017,6 +1029,10 @@ class ParallelTransformerLayer(MegatronModule):
             self._retriever_key = 'retriever'
         else:
             self.retriever = None
+
+    def update_threshold(self, new_threshold):
+        if self.num_experts > 1:
+            self.mlp.deepspeed_moe.gate.threshold = new_threshold
 
     def default_decoder_cross_attention(self,
                                         encoder_output,
@@ -1319,10 +1335,16 @@ class ParallelTransformerLayer(MegatronModule):
         moe_loss = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
         mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
 
+        my_probe = {}
+
         if self.num_experts == 1:
-            mlp_output, mlp_bias = self.mlp(layernorm_output)
+            mlp_output, mlp_bias, non_zero_ratio = self.mlp(layernorm_output)
         else:
-            mlp_output, moe_loss, _ = self.mlp(layernorm_output)
+            args = get_args()
+
+            mlp_output, moe_loss, _, gate_info = self.mlp(layernorm_output, now_training_process=float(args.iteration) / args.train_iters)
+
+            my_probe = gate_info
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1361,7 +1383,7 @@ class ParallelTransformerLayer(MegatronModule):
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output, moe_loss
         else:
-            return output, moe_loss
+            return output, moe_loss, my_probe
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
@@ -1611,6 +1633,7 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     num_experts=n_e)
             else:
+                raise Exception("honoka here!!!!")
                 assert config.num_attention_heads == config.num_key_value_heads, \
                         'Transformer_engine does not support GQA'
                 return transformer_engine.pytorch.TransformerLayer(
@@ -1734,6 +1757,11 @@ class ParallelTransformer(MegatronModule):
             global get_cuda_rng_tracker, checkpoint
             get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
             checkpoint = deepspeed.checkpointing.checkpoint
+    
+    def update_threshold(self, new_threshold):
+        for index in range(self.num_layers):
+            layer = self._get_layer(index)
+            layer.update_threshold(new_threshold)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -1856,6 +1884,8 @@ class ParallelTransformer(MegatronModule):
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
+        my_probe = {}
+
         # Checks.
         if inference_params:
             assert self.recompute_granularity is None, \
@@ -1928,6 +1958,7 @@ class ParallelTransformer(MegatronModule):
                 # Forward pass.
                 moe_losses = []
                 if self.checkpoint_activations:
+                    raise Exception("honoka here!!")
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
@@ -1935,6 +1966,7 @@ class ParallelTransformer(MegatronModule):
                                                                rotary_pos_emb,
                                                                is_first_microbatch)
                 elif self.recompute_granularity == 'full':
+                    raise Exception("honoka here!!")
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
@@ -1942,6 +1974,8 @@ class ParallelTransformer(MegatronModule):
                                                                rotary_pos_emb,
                                                                is_first_microbatch)
                 else:
+                    all_layer_probes = []
+
                     forward_kwargs = {
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
@@ -1971,16 +2005,27 @@ class ParallelTransformer(MegatronModule):
                         # and retriever_output. Make retriever_output available
                         # to subsequence Retro layers.
                         if isinstance(hidden_states, tuple):
-                            assert (len(hidden_states) == 2 or len(hidden_states) == 3)
-                            if len(hidden_states) == 2:
-                                if not self.ds_inference:
-                                    hidden_states, moe_loss = hidden_states
-                                    moe_losses.append(moe_loss)
-                            else:
-                                forward_kwargs["retriever_output"] = hidden_states[1]
-                                if not self.ds_inference:
-                                    hidden_states, _, moe_loss = hidden_states
-                                    moe_losses.append(moe_loss)
+                            if not self.ds_inference:
+                                hidden_states, moe_loss, this_probe = hidden_states
+                                moe_losses.append(moe_loss)
+                                if len(this_probe.keys()) > 0:
+                                    all_layer_probes.append(this_probe)
+
+                            # assert (len(hidden_states) == 2 or len(hidden_states) == 3)
+                            # if len(hidden_states) == 2:
+                            #     if not self.ds_inference:
+                            #         hidden_states, moe_loss = hidden_states
+                            #         moe_losses.append(moe_loss)
+                            # else:
+                            #     forward_kwargs["retriever_output"] = hidden_states[1]
+                            #     if not self.ds_inference:
+                            #         hidden_states, _, moe_loss = hidden_states
+                            #         moe_losses.append(moe_loss)
+                    
+                    if len(all_layer_probes) > 0:
+                        for key in all_layer_probes[0]:
+                            items_for_key = [x[key] for x in all_layer_probes]
+                            my_probe[key] = items_for_key
 
                 # Skip counter update for eval and activation checkpointing
                 if torch.is_grad_enabled() and self.training:
@@ -1995,7 +2040,7 @@ class ParallelTransformer(MegatronModule):
             #     hidden_states = hidden_states.transpose(0, 1).contiguous()
             hidden_states = self.final_layernorm(hidden_states)
 
-        return (hidden_states, *moe_losses)
+        return (hidden_states, my_probe, *moe_losses)
 
 class LMHeadPipe(MegatronModule):
     """

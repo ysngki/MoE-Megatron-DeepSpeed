@@ -97,6 +97,7 @@ def get_forward_backward_func():
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
+        raise Exception("honoka here!!!!")
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
@@ -171,7 +172,8 @@ def forward_step(forward_step_func,
                  forward_data_store,
                  config,
                  collect_non_loss_data=False,
-                 checkpoint_activations_microbatch=None):
+                 checkpoint_activations_microbatch=None,
+                 yyh_probe_data_store=[]):
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data_iterator, otherwise
@@ -196,9 +198,11 @@ def forward_step(forward_step_func,
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output_tensor, my_probe, loss_func = forward_step_func(data_iterator, model)
         else:
-            output_tensor, loss_func = forward_step_func(data_iterator, model, checkpoint_activations_microbatch)
+            output_tensor, my_probe, loss_func = forward_step_func(data_iterator, model, checkpoint_activations_microbatch)
+
+        yyh_probe_data_store.append(my_probe)
 
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
@@ -343,11 +347,12 @@ def forward_backward_no_pipelining(*,
     model_type = get_model_type(model)
 
     forward_data_store = []
+    yyh_probe_data_store = []
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                         input_tensor, forward_data_store, config, collect_non_loss_data)
+                                         input_tensor, forward_data_store, config, collect_non_loss_data, yyh_probe_data_store=yyh_probe_data_store)
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
     if args.deepspeed:
@@ -356,12 +361,133 @@ def forward_backward_no_pipelining(*,
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
     output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                 input_tensor, forward_data_store, config, collect_non_loss_data)
+                                 input_tensor, forward_data_store, config, collect_non_loss_data, yyh_probe_data_store=yyh_probe_data_store)
 
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
 
-    return forward_data_store
+    return forward_data_store, yyh_probe_reduce(yyh_probe_data_store)
+
+
+def yyh_probe_reduce(probe_data_store):
+    # merge all my_probes:
+    final_my_probe = {}
+    
+    for key in probe_data_store[0]:
+        items_for_key = [x[key] for x in probe_data_store] # (value of minibatch1, value of minibatch2.....)
+        final_my_probe[key] = items_for_key
+
+    ## merge top1_p
+    if not(final_my_probe.get('top1_p') is None):
+        moe_layer_num = len(final_my_probe['top1_p'][0])
+        all_layer_top1_p = []
+        for this_l_index in range(moe_layer_num):
+            temp_list = []
+            
+            for mini_batch_item in final_my_probe['top1_p']:
+                temp_list.append(mini_batch_item[this_l_index])
+            all_layer_top1_p.append(torch.cat(temp_list, dim=0))
+    
+        final_my_probe['top1_p'] = all_layer_top1_p
+
+    ## merge non_zero_ratio
+    if not(final_my_probe.get('non_zero_ratio') is None):
+        moe_layer_num = len(final_my_probe['non_zero_ratio'][0])
+        all_layer_non_zero_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['non_zero_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['non_zero_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_non_zero_ratio.append(temp_sum / len(final_my_probe['non_zero_ratio']))
+    
+        final_my_probe['non_zero_ratio'] = all_layer_non_zero_ratio
+
+    if not(final_my_probe.get('chosen_num') is None):
+        moe_layer_num = len(final_my_probe['chosen_num'][0])
+        all_layer_chosen_num = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['chosen_num'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['chosen_num'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_chosen_num.append(temp_sum / len(final_my_probe['chosen_num']))
+
+        final_my_probe['chosen_num'] = all_layer_chosen_num
+
+    if not(final_my_probe.get('one_expert_ratio') is None):
+        moe_layer_num = len(final_my_probe['one_expert_ratio'][0])
+        all_layer_one_expert_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['one_expert_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['one_expert_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_one_expert_ratio.append(temp_sum / len(final_my_probe['one_expert_ratio']))
+
+        final_my_probe['one_expert_ratio'] = all_layer_one_expert_ratio
+    
+    if not(final_my_probe.get('token_not_full_ratio') is None):
+        moe_layer_num = len(final_my_probe['token_not_full_ratio'][0])
+        all_layer_token_not_full_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['token_not_full_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['token_not_full_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_token_not_full_ratio.append(temp_sum / len(final_my_probe['token_not_full_ratio']))
+
+        final_my_probe['token_not_full_ratio'] = all_layer_token_not_full_ratio
+
+    if not(final_my_probe.get('expert_not_full_ratio') is None):
+        moe_layer_num = len(final_my_probe['expert_not_full_ratio'][0])
+        all_layer_expert_not_full_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['expert_not_full_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['expert_not_full_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_expert_not_full_ratio.append(temp_sum / len(final_my_probe['expert_not_full_ratio']))
+
+        final_my_probe['expert_not_full_ratio'] = all_layer_expert_not_full_ratio
+
+    if not(final_my_probe.get('want_num') is None):
+        moe_layer_num = len(final_my_probe['want_num'][0])
+        all_layer_want_num = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['want_num'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['want_num'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_want_num.append(temp_sum / len(final_my_probe['want_num']))
+
+        final_my_probe['want_num'] = all_layer_want_num
+    
+    if not(final_my_probe.get('max_load_ratio') is None):
+        moe_layer_num = len(final_my_probe['max_load_ratio'][0])
+        all_layer_max_load_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['max_load_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['max_load_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_max_load_ratio.append(temp_sum / len(final_my_probe['max_load_ratio']))
+
+        final_my_probe['max_load_ratio'] = all_layer_max_load_ratio
+    
+    if not(final_my_probe.get('avg_load_ratio') is None):
+        moe_layer_num = len(final_my_probe['avg_load_ratio'][0])
+        all_layer_avg_load_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['avg_load_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['avg_load_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_avg_load_ratio.append(temp_sum / len(final_my_probe['avg_load_ratio']))
+
+        final_my_probe['avg_load_ratio'] = all_layer_avg_load_ratio
+    
+    return final_my_probe
 
 
 def forward_backward_pipelining_with_interleaving(*,

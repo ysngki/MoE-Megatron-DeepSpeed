@@ -561,7 +561,7 @@ def setup_model_and_optimizer(model_provider_func,
                 # build_train_valid_test_data_iterators.
                 eval_iters = (args.train_iters // args.eval_interval + 1) * \
                             args.eval_iters
-                test_iters = args.eval_iters
+                test_iters = args.test_iters
                 train_val_test_num_samples = [train_samples,
                                             eval_iters * args.global_batch_size,
                                             test_iters * args.global_batch_size]
@@ -663,7 +663,7 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
-    losses_reduced = forward_backward_func(
+    losses_reduced, my_probe = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
         model=model,
@@ -726,7 +726,7 @@ def train_step(forward_step_func, data_iterator,
         for key in losses_reduced[0]:
             losses_reduced_for_key = [x[key] for x in losses_reduced]
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad, my_probe
     else:
         if update_successful:
             increment = get_num_microbatches() * \
@@ -754,7 +754,7 @@ def train_step(forward_step_func, data_iterator,
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
                  grad_norm, params_norm, num_zeros_in_grad,
-                 model=None, optimizer=None):
+                 model=None, optimizer=None, my_probe={}):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -1045,6 +1045,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[nan_iters_key])
         log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
+
+        log_string = yyh_update_log_string(my_probe=my_probe, log_string=log_string)
+
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -1121,7 +1124,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
                     args.iteration + 1)
         args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad, my_probe = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
@@ -1169,7 +1172,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad,
-                                          model, optimizer)
+                                          model, optimizer, my_probe=my_probe)
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -1235,7 +1238,8 @@ def evaluate(forward_step_func,
              model,
              process_non_loss_data_func,
              config,
-             verbose=False):
+             verbose=False,
+             test=False):
     """Evaluation."""
     args = get_args()
 
@@ -1258,13 +1262,23 @@ def evaluate(forward_step_func,
 
     total_loss_dict = {}
 
+    if test:
+        run_iters = args.test_iters
+    else:
+        run_iters = args.eval_iters
+
     with torch.no_grad():
         iteration = 0
-        while iteration < args.eval_iters:
+        timers = get_timers()
+        timers('eval-interval-time', log_level=0).start(barrier=True)
+
+        while iteration < run_iters:
             iteration += 1
             if verbose and iteration % args.log_interval == 0:
-                print_rank_0('Evaluating iter {}/{}'.format(iteration,
-                                                            args.eval_iters))
+                elapsed_time = timers('eval-interval-time').elapsed(barrier=True)
+                print_rank_0('Evaluating iter {}/{}, elapsed_time(ms) {}'.format(iteration,
+                                                            run_iters, elapsed_time*1000/args.log_interval))
+                # timers('eval-interval-time', log_level=0).start(barrier=True)
 
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
@@ -1275,7 +1289,7 @@ def evaluate(forward_step_func,
                 loss = model[0].eval_batch(data_iterator)
                 loss_dicts = [{'lm loss' : loss}] * get_num_microbatches()
             else:
-                loss_dicts = forward_backward_func(
+                loss_dicts, final_my_probe = forward_backward_func(
                     forward_step_func=forward_step_func,
                     data_iterator=data_iterator,
                     model=model,
@@ -1301,6 +1315,9 @@ def evaluate(forward_step_func,
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
                                            * get_num_microbatches()
+        
+        timers('eval-interval-time').stop(barrier=True)
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -1319,7 +1336,7 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
+        total_loss_dict[key] /= run_iters * get_num_microbatches()
 
     if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
         # roll back to actual curriculum seqlen at the end of eval.
@@ -1343,7 +1360,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, data_iterator, model,
-        process_non_loss_data_func, config, verbose)
+        process_non_loss_data_func, config, verbose, test)
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
@@ -1395,7 +1412,7 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
         train_samples = args.train_iters * args.global_batch_size
     eval_iters = (args.train_iters // args.eval_interval + 1) * \
                  args.eval_iters
-    test_iters = args.eval_iters
+    test_iters = args.test_iters
     train_val_test_num_samples = [train_samples,
                                   eval_iters * args.global_batch_size,
                                   test_iters * args.global_batch_size]
@@ -1446,7 +1463,7 @@ def build_train_valid_test_data_loaders(
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
         do_valid = valid_dataloader is not None and args.eval_iters > 0
-        do_test = test_dataloader is not None and args.eval_iters > 0
+        do_test = test_dataloader is not None and args.test_iters > 0
         # Need to broadcast num_tokens and num_type_tokens.
         flags = get_accelerator().LongTensor(
             [int(do_train), int(do_valid), int(do_test)])
@@ -1503,3 +1520,149 @@ def build_train_valid_test_data_iterators(
         test_data_iterator = None
 
     return train_data_iterator, valid_data_iterator, test_data_iterator
+
+
+def yyh_update_log_string(my_probe, log_string):
+    # add my_probe
+    if not(my_probe.get("top1_p") is None):
+        # this_layer_tokens = torch.cat(my_probe['top1_p'], dim=0)
+        for this_layer_tokens in my_probe['top1_p']:
+            max_p = torch.max(this_layer_tokens)
+            min_p = torch.min(this_layer_tokens)
+            mean_p = torch.mean(this_layer_tokens)
+            median_p = torch.median(this_layer_tokens)
+
+            last_quantile = torch.quantile(this_layer_tokens, 0.25)
+            first_quantile = torch.quantile(this_layer_tokens, 0.75)
+
+            log_string += '| top1-max-min-mean-median-25\%-75\%: {:3f}, {:3f}, {:3f}, {:3f}, {:3f}, {:3f} |'.format(
+            max_p, min_p, mean_p, median_p, last_quantile, first_quantile)
+
+        log_string += "\n"
+
+    # add my_probe
+    if not(my_probe.get("non_zero_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("non_zero_ratio")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' non_zero_ratio : {averaged_ratios.tolist()}|'
+    
+    if not(my_probe.get("token_not_full_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("token_not_full_ratio")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' token_not_full_ratio : {averaged_ratios.tolist()}|'
+
+    if not(my_probe.get("expert_not_full_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("expert_not_full_ratio")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' expert_not_full_ratio : {averaged_ratios.tolist()}|'
+
+    # add my_probe
+    if not(my_probe.get("chosen_num") is None):
+        # list: len = moe_layer_num, element is a tensor
+
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("chosen_num")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' avg valid chosen num : {averaged_ratios.tolist()}|'
+
+    if not(my_probe.get("want_num") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("want_num")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' want_num : {averaged_ratios.tolist()}|'
+
+    if not(my_probe.get("one_expert_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("one_expert_ratio")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' one_expert_ratio : {averaged_ratios.tolist()}|'
+
+    if not(my_probe.get("max_load_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        max_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
+
+        torch.distributed.all_reduce(max_ratios, op=torch.distributed.ReduceOp.MAX,
+                                    group=mpu.get_data_parallel_group())
+        
+        min_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
+
+        torch.distributed.all_reduce(min_ratios, op=torch.distributed.ReduceOp.MAX,
+                                    group=mpu.get_data_parallel_group())
+        
+        mean_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
+
+        torch.distributed.all_reduce(mean_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        mean_ratios = mean_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+        
+        log_string += f'\n max_load_ratio : {max_ratios.tolist()} (max), {mean_ratios.tolist()} (mean), {min_ratios.tolist()} (min)|'
+
+    if not(my_probe.get("avg_load_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        mean_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("avg_load_ratio")])
+
+        torch.distributed.all_reduce(mean_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        mean_ratios = mean_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+        
+        log_string += f' avg_load_ratio : {mean_ratios.tolist()}|'
+
+    return log_string
