@@ -415,6 +415,31 @@ def yyh_probe_reduce(probe_data_store):
 
         final_my_probe['chosen_num'] = all_layer_chosen_num
 
+    if not(final_my_probe.get('skip_ratio') is None):
+        moe_layer_num = len(final_my_probe['skip_ratio'][0])
+        all_layer_skip_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['skip_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['skip_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_skip_ratio.append(temp_sum / len(final_my_probe['skip_ratio']))
+
+        final_my_probe['skip_ratio'] = all_layer_skip_ratio
+
+    if not(final_my_probe.get('token_no_choose_ratio') is None):
+        moe_layer_num = len(final_my_probe['token_no_choose_ratio'][0])
+        all_layer_token_no_choose_ratio = []
+        for this_l_index in range(moe_layer_num):
+            temp_sum = final_my_probe['token_no_choose_ratio'][0][this_l_index]
+            
+            for mini_batch_item in final_my_probe['token_no_choose_ratio'][1:]:
+                temp_sum += mini_batch_item[this_l_index]
+            all_layer_token_no_choose_ratio.append(temp_sum / len(final_my_probe['token_no_choose_ratio']))
+
+        final_my_probe['token_no_choose_ratio'] = all_layer_token_no_choose_ratio
+
+
     if not(final_my_probe.get('one_expert_ratio') is None):
         moe_layer_num = len(final_my_probe['one_expert_ratio'][0])
         all_layer_one_expert_ratio = []

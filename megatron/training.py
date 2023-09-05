@@ -1598,6 +1598,34 @@ def yyh_update_log_string(my_probe, log_string):
 
         log_string += f' layers\' avg valid chosen num : {averaged_ratios.tolist()}|'
 
+    if not(my_probe.get("skip_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+        
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("skip_ratio")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' skip_ratio : {averaged_ratios.tolist()}|'
+
+    if not(my_probe.get("token_no_choose_ratio") is None):
+        # list: len = moe_layer_num, element is a tensor
+
+        averaged_ratios = torch.cat(
+            [ratio.clone().detach().view(1) for ratio in my_probe.get("token_no_choose_ratio")])
+
+        torch.distributed.all_reduce(averaged_ratios,
+                                    group=mpu.get_data_parallel_group())
+        
+        averaged_ratios = averaged_ratios / \
+            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+        log_string += f' layers\' avg token_no_choose_ratio : {averaged_ratios.tolist()}|'
+
     if not(my_probe.get("want_num") is None):
         # list: len = moe_layer_num, element is a tensor
         

@@ -167,6 +167,19 @@ def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> T
 
 
 @torch.jit.script
+def _capacity_plus_on(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> Tensor:
+    # gates has shape of SE
+    num_tokens = gates.shape[0]
+    num_experts = gates.shape[1] - 1
+    # to(torch.int64) works around a bug in torch.onnx.export:
+    # it should cast k to int64 when converting torch.topk but it doesn't.
+    capacity = torch.ceil((num_tokens / num_experts) * capacity_factor).to(torch.int64)
+    if capacity < min_capacity:
+        capacity = min_capacity.to(torch.int64)
+    return capacity
+
+
+@torch.jit.script
 def _top_idx(source, k):
     return torch.topk(source, k=k, dim=0)[1]
 
@@ -440,6 +453,106 @@ def old_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: in
     return l_aux, combine_weights, dispatch_mask, exp_counts, top1_p, avg_valid_chosen_num
 
 
+def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    # everything is in fp32 in this function
+    gates = F.softmax(logits, dim=1)
+
+    top1_p, _ = torch.max(gates, dim=1)
+
+    ### devloping ###
+    # one_expert_token_num = (top1_p > threshold).sum()
+    #################
+
+    capacity = _capacity_plus_on(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
+
+    # Create a mask for 1st's expert per token
+    num_experts = int(gates.shape[1])
+    
+    indices1_s = torch.argmax(gates, dim=1)
+    mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+    # gating decisions (no use)
+    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+
+    # threshold
+    # gates_sorted, gates_indices = torch.sort(gates, dim=-1, descending=True)
+    explore_top_k_num = max(min(int(2 * k), num_experts), 1)
+    gates_sorted, gates_indices = torch.topk(gates, dim=-1, k=explore_top_k_num, largest=True, sorted=True)
+    
+    cum_sorted_gates = torch.cumsum(gates_sorted, dim=-1)
+    chosen_flag = (cum_sorted_gates - gates_sorted) < threshold  # (token num, explore_top_k_num)
+    chosen_flag[:, 0] = True # at least select one expert
+    whole_chosen_indices = chosen_flag * (gates_indices + 1) # (token num, explore_top_k_num) \in (0, actual_expert_num), 0 means not choose, 1 means choose placeholder expert (the first expert)
+    skip_ratio = (whole_chosen_indices == 1).sum() / whole_chosen_indices.shape[0]
+
+    chosen_indices = torch.transpose(whole_chosen_indices, 0, 1)  # (explore_top_k_num, token_num)
+
+    # get masks and capacity locations
+    # stop_index = chosen_indices.sum(dim=-1).ne(0).sum()
+    # stop_index = min(int(2 * capacity_factor), stop_index)
+
+    # chosen_indices = chosen_indices[:stop_index] # (chosen_num, token_num)
+
+    tensor_all_mask = F.one_hot(chosen_indices, num_classes=num_experts + 1)[:, :, 2:] # (explore_top_k_num, token_num, expert_num)
+    _, token_num, expert_num = tensor_all_mask.shape
+
+    tensor_all_locations = torch.cumsum(tensor_all_mask.view(-1, expert_num), dim=0).view(tensor_all_mask.shape) - 1 # (chosen_num, token_num, expert_num)
+    
+    expert_received_num = tensor_all_locations[-1, -1, :] + 1
+    expert_not_full_ratio = (expert_received_num < capacity).sum() / expert_num # maybe near 100% since placeholder expert
+    
+    tensor_all_locations = tensor_all_locations * tensor_all_mask # (chosen_num, token_num, expert_num)
+
+    # Compute l_aux  !!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+    me = torch.mean(gates, dim=0)
+    
+    # ce = torch.sum(mask1.float(), dim=0)
+    # for i in range(1, dynamic_k):
+    #     ce += torch.sum(all_mask[i].float(), dim=0)
+    # ce /= ce.sum()
+
+    # ce = expert_received_num / expert_received_num.sum()
+
+    ce = torch.mean(mask1.float(), dim=0)
+
+    l_aux = torch.sum(me * ce) * num_experts
+    
+    gates = gates[:, 1:]
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+
+
+    tensor_all_mask = tensor_all_mask.sum(dim=0) # (token_num, expert_num)
+    
+    token_chosen_num = tensor_all_mask.sum(dim=-1) # (token_num)
+    token_not_full_ratio = (token_chosen_num < capacity_factor).sum() / token_num
+    token_no_expert_ratio = (token_chosen_num == 0).sum() / token_num
+
+    tensor_all_locations = tensor_all_locations.sum(dim=0) # (token_num, expert_num)
+    tensor_all_mask = tensor_all_mask * torch.lt(tensor_all_locations, capacity)
+    
+    tensor_all_mask_float = tensor_all_mask.float()
+    tensor_all_gates = gates * tensor_all_mask_float # (s, e)
+
+
+    all_locations_sc = _one_hot_to_float(tensor_all_locations * tensor_all_mask, capacity) # (s, e, c)
+    combine_weights = all_locations_sc * tensor_all_gates.unsqueeze(-1) # (s, e, c)
+
+    dispatch_mask = combine_weights.bool()
+    
+    all_valid_chosen_num = tensor_all_mask.sum()
+    avg_valid_chosen_num = all_valid_chosen_num / token_num
+
+    gate_info = {
+        "top1_p": top1_p,
+        "chosen_num": avg_valid_chosen_num,
+        "skip_ratio": skip_ratio,
+        "token_not_full_ratio": token_not_full_ratio,
+        "token_no_choose_ratio": token_no_expert_ratio,
+        "expert_not_full_ratio": expert_not_full_ratio
+                 }
+    return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
+
+
 def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
@@ -461,7 +574,9 @@ def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: in
     exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
 
     # threshold
-    gates_sorted, gates_indices = torch.sort(gates, dim=-1, descending=True)
+    # gates_sorted, gates_indices = torch.sort(gates, dim=-1, descending=True)
+    top_k_num = max(min(int(2 * k), num_experts), 1)
+    gates_sorted, gates_indices = torch.topk(gates, dim=-1, k=top_k_num, largest=True, sorted=True)
     
     cum_sorted_gates = torch.cumsum(gates_sorted, dim=-1)
     chosen_flag = (cum_sorted_gates - gates_sorted) < threshold  # (token num, expert num)
@@ -558,12 +673,16 @@ class TopKGate(Module):
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
                  use_rts: bool = True,
-                 threshold: float = -1.0) -> None:
+                 threshold: float = -1.0,
+                 placeholder_expert: bool = False) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
         # if k != 1 and k != 2:
         #     raise ValueError('Only top-1 and top-2 gatings are supported.')
+        self.placeholder_expert = placeholder_expert
+        if placeholder_expert:
+            num_experts += 1
         self.wg = torch.nn.Linear(model_dim, num_experts, bias=False).float()
         self.k = k
         self.capacity_factor = capacity_factor
@@ -599,7 +718,7 @@ class TopKGate(Module):
         else:
             logits = in_logits
 
-        if self.k < 0:
+        if self.k == 1:
             gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity, used_token, self.noisy_gate_policy if self.training else None,
                                      self.drop_tokens, self.use_rts, use_tutel)
@@ -608,8 +727,12 @@ class TopKGate(Module):
             # gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
             #                          self.min_capacity)
 
-            gate_output = new_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+            if self.placeholder_expert:
+                gate_output = plus_one_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity, self.k, self.threshold)
+            else:
+                gate_output = new_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                                        self.min_capacity, self.k, self.threshold)
 
         if self.wall_clock_breakdown:
             self.timers('TopKGate').stop()

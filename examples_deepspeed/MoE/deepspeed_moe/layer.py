@@ -48,7 +48,8 @@ class MoE(torch.nn.Module):
                  use_rts=True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
-                 threshold: float = -1.0):
+                 threshold: float = -1.0,
+                 placeholder_expert: bool = False):
 
         super(MoE, self).__init__()
 
@@ -69,7 +70,7 @@ class MoE(torch.nn.Module):
 
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
         self.deepspeed_moe = MOELayer(TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, threshold=threshold),
+                                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, threshold=threshold, placeholder_expert=placeholder_expert),
                                       experts,
                                       self.expert_group_name,
                                       self.ep_size,
