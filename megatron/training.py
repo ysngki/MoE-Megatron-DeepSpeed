@@ -1542,8 +1542,8 @@ def yyh_update_log_string(my_probe, log_string):
     log_tensor_list = []
     log_tensor_len_list = []
 
-    log_keys = ["gate_time", "moe_time", "non_zero_ratio", "token_not_full_ratio", "expert_not_full_ratio", "chosen_num", "skip_ratio", "token_no_choose_ratio", "want_num", "one_expert_ratio", "avg_load_ratio"]
-    log_print_keys = ["gate_time (ms)", "moe_time (ms)", "non_zero_ratio", "token_not_full_ratio", "expert_not_full_ratio", "valid_chosen_num", "skip_ratio", "token_no_choose_ratio", "want_num", "one_expert_ratio", "avg_load_ratio"]
+    log_keys = ["gate_time", 'salltoall_time', 'falltoall_time', "moe_time", "non_zero_ratio", "token_not_full_ratio", "expert_not_full_ratio", "chosen_num", "skip_ratio", "token_no_choose_ratio", "want_num", "one_expert_ratio", "avg_load_ratio"]
+    log_print_keys = ["gate_time", 'salltoall_time', 'falltoall_time', "moe_time (ms)", "non_zero_ratio", "token_not_full_ratio", "expert_not_full_ratio", "valid_chosen_num", "skip_ratio", "token_no_choose_ratio", "want_num", "one_expert_ratio", "avg_load_ratio"]
     
     assert len(log_keys) == len(log_print_keys)
 
@@ -1552,7 +1552,7 @@ def yyh_update_log_string(my_probe, log_string):
     for index, lk in enumerate(log_keys):
         if not(my_probe.get(lk) is None):
             # float
-            if lk in ["gate_time", "moe_time"]:
+            if lk in ["gate_time", 'salltoall_time', 'falltoall_time', "moe_time"]:
                 this_tensor = torch.tensor([v for v in my_probe.get(lk)], device=get_accelerator().device_name())
             # tensor
             else:

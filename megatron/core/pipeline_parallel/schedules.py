@@ -393,10 +393,29 @@ def yyh_probe_reduce(probe_data_store):
 
             final_my_probe[this_key] = all_layer_this_value
 
+    # sum across different minibatch
+    log_keys = ["gate_time", "moe_time", 'salltoall_time', 'falltoall_time']
+    
+    for this_key in log_keys:
+        if not(final_my_probe.get(this_key) is None):
+            moe_layer_num = len(final_my_probe[this_key][0])
+            mini_batch_num = len(final_my_probe[this_key])
+
+            all_layer_this_value = []
+            for this_l_index in range(moe_layer_num):
+                temp_sum = final_my_probe[this_key][0][this_l_index]
+
+                if mini_batch_num > 1:
+                    for mini_batch_item in final_my_probe[this_key][1:]:
+                        temp_sum += mini_batch_item[this_l_index]
+                all_layer_this_value.append(temp_sum)
+
+            final_my_probe[this_key] = all_layer_this_value
+
     # avg across different minibatch
     log_keys = ['non_zero_ratio', 'chosen_num', 'skip_ratio', 'token_no_choose_ratio', 
                 'one_expert_ratio', 'token_not_full_ratio', 'expert_not_full_ratio', 
-                'want_num', 'avg_load_ratio', "gate_time", "moe_time"]
+                'want_num', 'avg_load_ratio']
     
     for this_key in log_keys:
         if not(final_my_probe.get(this_key) is None):

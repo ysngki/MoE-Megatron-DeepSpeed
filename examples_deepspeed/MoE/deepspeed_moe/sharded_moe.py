@@ -608,7 +608,8 @@ def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: in
 
     # threshold
     # gates_sorted, gates_indices = torch.sort(gates, dim=-1, descending=True)
-    explore_top_k_num = max(min(int(2 * k), num_experts), 1)
+    # explore_top_k_num = max(min(int(2 * k), num_experts), 1)
+    explore_top_k_num = num_experts
     gates_sorted, gates_indices = torch.topk(gates, dim=-1, k=explore_top_k_num, largest=True, sorted=True)
     
     cum_sorted_gates = torch.cumsum(gates_sorted, dim=-1)
@@ -629,7 +630,7 @@ def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: in
     tensor_all_mask = new_mask1
     # -------------------------------------------
 
-    tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0).view(token_num, expert_num) - 1 # (token_num, expert_num)
+    tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0) - 1 # (token_num, expert_num)
 
     expert_received_num = tensor_all_locations[-1, :] + 1
     expert_not_full_ratio = (expert_received_num < capacity).sum() / expert_num
@@ -812,7 +813,7 @@ class MOELayer(Base):
         self.time_salltoall = 0.0
         self.time_moe = 0.0
         self.timers = SynchronizedWallClockTimer()
-        self.wall_clock_breakdown = False
+        self.wall_clock_breakdown = True
 
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
@@ -830,8 +831,8 @@ class MOELayer(Base):
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
 
-        # if self.wall_clock_breakdown:
-        self.timers(MOE_TIMER).start()
+        if self.wall_clock_breakdown:
+            self.timers(MOE_TIMER).start()
 
         # Implement Algorithm 2 from GShard paper.
         sequence_len = input[0].shape[0]
@@ -921,11 +922,13 @@ class MOELayer(Base):
 
         a = combined_output.reshape(input[0].shape)
 
-        # if self.wall_clock_breakdown:
-        self.timers(MOE_TIMER).stop()
-        self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
+        if self.wall_clock_breakdown:
+            self.timers(MOE_TIMER).stop()
+            self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
 
-        self.gate_info['gate_time'] = self.gate.gate_time
-        self.gate_info['moe_time'] = self.time_moe
+            self.gate_info['gate_time'] = self.gate.gate_time
+            self.gate_info['falltoall_time'] = self.time_falltoall
+            self.gate_info['salltoall_time'] = self.time_salltoall
+            self.gate_info['moe_time'] = self.time_moe
 
         return a
