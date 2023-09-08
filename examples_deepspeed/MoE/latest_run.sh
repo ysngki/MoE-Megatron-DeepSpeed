@@ -14,7 +14,7 @@ MODEL_SIZE=0.08
 NUM_LAYERS=6
 HIDDEN_SIZE=768
 FFN_HIDDEN_SIZE=3072
-MOE_FFN_HIDDEN_SIZE=768
+MOE_FFN_HIDDEN_SIZE=3072
 NUM_FFN_HEADS=1
 NUM_ATTN_HEADS=12
 GLOBAL_BATCH_SIZE=256
@@ -115,7 +115,7 @@ LR_DECAY_TOKENS=300000000000
 ### Parallelism configs
 ## Micro batch size per GPU
 ## Make sure that BATCH_SIZE <= GLOBAL_BATCH_SIZE*PP_SIZE*MP_SIZE/NUM_GPUS
-BATCH_SIZE=8
+BATCH_SIZE=16
 
 ## Model parallelism, 1 is no MP
 ## Currently MoE models have divergence issue when MP > 1.
@@ -129,16 +129,16 @@ NUM_GPUS=$(($(ds_ssh nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)-
 NUM_GPUS_PERNODE=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 NUM_NODE=$(( ${NUM_GPUS} / ${NUM_GPUS_PERNODE} ))
 
-NUM_GPUS=2
+NUM_GPUS=1
 NUM_NODE=1
 ###############################################################################
 ### MoE configs
 ## Number of experts. EP_SIZE 1 means dense model without MoE
 # EP_SIZE=1
 # EP_SIZE=$((${NUM_FFN_HEADS} * 16))
-EP_SIZE=16
+EP_SIZE=4
 EP_INTERVAL=3
-TOPK=4
+TOPK=1
 THRESHOLD=0.90
 GATE_VIEW_NUM=1
 
@@ -164,9 +164,9 @@ MLC=0.01
 ## eval. To completely disable capacity limit, set MOE_DROP_TOKEN to false.
 ## Larger capacity factor or disabling capacity limit could improve training
 ## convergence, but will also reduce training throughput.
-MOE_TRAIN_CAP_FACTOR=4.0
-MOE_EVAL_CAP_FACTOR=4.0
-FAKE_MOE_EVAL_CAP_FACTOR=4.0
+MOE_TRAIN_CAP_FACTOR=1.0
+MOE_EVAL_CAP_FACTOR=1.0
+FAKE_MOE_EVAL_CAP_FACTOR=1.0
 MOE_MIN_CAP=4
 MOE_DROP_TOKEN="true"
 # MOE_DROP_TOKEN="false"
@@ -220,7 +220,7 @@ if [[ $EP_SIZE -gt 1 ]]; then
         # NAME="Probe-NoNoise-${NAME}-ep-${EP_SIZE}-interval-${EP_INTERVAL}-ffnheads-${NUM_FFN_HEADS}-mlc-${MLC}-cap-${MOE_TRAIN_CAP_FACTOR}-${FAKE_MOE_EVAL_CAP_FACTOR}-drop-${MOE_DROP_TOKEN}"
         # NAME="Probe-${NAME}-ep-${EP_SIZE}-interval-${EP_INTERVAL}-topk-${TOPK}-ffnheads-${NUM_FFN_HEADS}-mlc-${MLC}-cap-${MOE_TRAIN_CAP_FACTOR}-${FAKE_MOE_EVAL_CAP_FACTOR}-drop-${MOE_DROP_TOKEN}"
     else
-        NAME="Top1-${NAME}-ep-${EP_SIZE}-interval-${EP_INTERVAL}-mlc-${MLC}-cap-${MOE_TRAIN_CAP_FACTOR}-${FAKE_MOE_EVAL_CAP_FACTOR}-drop-${MOE_DROP_TOKEN}"
+        NAME="Top1-Plaholder-${NAME}-ep-${EP_SIZE}-interval-${EP_INTERVAL}-mlc-${MLC}-cap-${MOE_TRAIN_CAP_FACTOR}-${FAKE_MOE_EVAL_CAP_FACTOR}-drop-${MOE_DROP_TOKEN}"
     fi
 fi
 if [ "${CL_ENABLED}" = "true" ]; then
@@ -336,7 +336,8 @@ megatron_options=" \
         --save ${CHECKPOINT_PATH} \
         --threshold ${THRESHOLD} \
         --gate-view-num ${GATE_VIEW_NUM} \
-        --no-pipeline-parallel"
+        --no-pipeline-parallel \
+        --placeholder-expert"
 #       --placeholder-expert
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
@@ -404,7 +405,7 @@ if [[ $ITERATION -gt 0 ]]; then
     ds_ssh "echo $ITERATION_2 > $ITERATION_FILE_2"
 fi
 
-run_cmd="CUDA_VISIBLE_DEVICES=2,3 deepspeed --master_port 61000 ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options} &> ${OUTPUT_BASEPATH}/log/${NAME}_${host}_${current_time}.log"
+run_cmd="CUDA_VISIBLE_DEVICES=2 deepspeed --master_port 61000 ${DIR}/../../pretrain_gpt.py ${megatron_options} ${data_options} ${deepspeed_options} &> ${OUTPUT_BASEPATH}/log/${NAME}_${host}_${current_time}.log"
 echo ${run_cmd}
 eval ${run_cmd}
 set +x
