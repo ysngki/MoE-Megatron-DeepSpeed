@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 
+import numpy as np
 from datetime import datetime
 import math
 import sys
@@ -1538,159 +1539,76 @@ def yyh_update_log_string(my_probe, log_string):
             log_string += '| top1-max-min-mean-median-25\%-75\%: {:3f}, {:3f}, {:3f}, {:3f}, {:3f}, {:3f} |'.format(
             max_p, min_p, mean_p, median_p, last_quantile, first_quantile)
 
-        log_string += "\n"
+    log_tensor_list = []
+    log_tensor_len_list = []
 
-    # add my_probe
-    if not(my_probe.get("non_zero_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
-        
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("non_zero_ratio")])
-
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-
-        log_string += f' layers\' non_zero_ratio : {averaged_ratios.tolist()}|'
+    log_keys = ["gate_time", "moe_time", "non_zero_ratio", "token_not_full_ratio", "expert_not_full_ratio", "chosen_num", "skip_ratio", "token_no_choose_ratio", "want_num", "one_expert_ratio", "avg_load_ratio"]
+    log_print_keys = ["gate_time (ms)", "moe_time (ms)", "non_zero_ratio", "token_not_full_ratio", "expert_not_full_ratio", "valid_chosen_num", "skip_ratio", "token_no_choose_ratio", "want_num", "one_expert_ratio", "avg_load_ratio"]
     
-    if not(my_probe.get("token_not_full_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
-        
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("token_not_full_ratio")])
+    assert len(log_keys) == len(log_print_keys)
 
-        torch.distributed.all_reduce(averaged_ratios,
+    valid_key_names = []
+
+    for index, lk in enumerate(log_keys):
+        if not(my_probe.get(lk) is None):
+            # float
+            if lk in ["gate_time", "moe_time"]:
+                this_tensor = torch.tensor([v for v in my_probe.get(lk)], device=get_accelerator().device_name())
+            # tensor
+            else:
+                this_tensor = torch.cat(
+                    [ratio.clone().detach().view(1) for ratio in my_probe.get(lk)])
+            this_tensor_len = len(this_tensor)
+
+            log_tensor_list.append(this_tensor)
+            log_tensor_len_list.append(this_tensor_len)   
+            
+            valid_key_names.append(log_print_keys[index])     
+
+    # concatenate then gather
+    whole_log_value_tensor = torch.cat(log_tensor_list)
+    torch.distributed.all_reduce(whole_log_value_tensor,
                                     group=mpu.get_data_parallel_group())
+    avg_whole_log_value_tensor = whole_log_value_tensor / \
+        torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+    # print
+    past_accum_len = 0
+    for this_index, this_key in enumerate(valid_key_names):
+        if this_index % 4 == 0:
+            log_string += "\n"
+            
+        this_len = log_tensor_len_list[this_index]
+
+        this_log_values = avg_whole_log_value_tensor[past_accum_len:past_accum_len+this_len]
+        past_accum_len += this_len
+
+        log_string += f' {this_key} : {np.around(this_log_values.tolist(), decimals=5)}|'
+
+    # if not(my_probe.get("max_load_ratio") is None):
+    #     # list: len = moe_layer_num, element is a tensor
         
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+    #     max_ratios = torch.cat(
+    #         [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
 
-        log_string += f' layers\' token_not_full_ratio : {averaged_ratios.tolist()}|'
-
-    if not(my_probe.get("expert_not_full_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
+    #     torch.distributed.all_reduce(max_ratios, op=torch.distributed.ReduceOp.MAX,
+    #                                 group=mpu.get_data_parallel_group())
         
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("expert_not_full_ratio")])
+    #     min_ratios = torch.cat(
+    #         [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
 
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
+    #     torch.distributed.all_reduce(min_ratios, op=torch.distributed.ReduceOp.MAX,
+    #                                 group=mpu.get_data_parallel_group())
         
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+    #     mean_ratios = torch.cat(
+    #         [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
 
-        log_string += f' layers\' expert_not_full_ratio : {averaged_ratios.tolist()}|'
-
-    # add my_probe
-    if not(my_probe.get("chosen_num") is None):
-        # list: len = moe_layer_num, element is a tensor
-
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("chosen_num")])
-
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
+    #     torch.distributed.all_reduce(mean_ratios,
+    #                                 group=mpu.get_data_parallel_group())
         
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-
-        log_string += f' layers\' avg valid chosen num : {averaged_ratios.tolist()}|'
-
-    if not(my_probe.get("skip_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
+    #     mean_ratios = mean_ratios / \
+    #         torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
         
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("skip_ratio")])
-
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-
-        log_string += f' layers\' skip_ratio : {averaged_ratios.tolist()}|'
-
-    if not(my_probe.get("token_no_choose_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
-
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("token_no_choose_ratio")])
-
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-
-        log_string += f' layers\' avg token_no_choose_ratio : {averaged_ratios.tolist()}|'
-
-    if not(my_probe.get("want_num") is None):
-        # list: len = moe_layer_num, element is a tensor
-        
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("want_num")])
-
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-
-        log_string += f' want_num : {averaged_ratios.tolist()}|'
-
-    if not(my_probe.get("one_expert_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
-        
-        averaged_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("one_expert_ratio")])
-
-        torch.distributed.all_reduce(averaged_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        averaged_ratios = averaged_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-
-        log_string += f' layers\' one_expert_ratio : {averaged_ratios.tolist()}|'
-
-    if not(my_probe.get("max_load_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
-        
-        max_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
-
-        torch.distributed.all_reduce(max_ratios, op=torch.distributed.ReduceOp.MAX,
-                                    group=mpu.get_data_parallel_group())
-        
-        min_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
-
-        torch.distributed.all_reduce(min_ratios, op=torch.distributed.ReduceOp.MAX,
-                                    group=mpu.get_data_parallel_group())
-        
-        mean_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("max_load_ratio")])
-
-        torch.distributed.all_reduce(mean_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        mean_ratios = mean_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-        
-        log_string += f'\n max_load_ratio : {max_ratios.tolist()} (max), {mean_ratios.tolist()} (mean), {min_ratios.tolist()} (min)|'
-
-    if not(my_probe.get("avg_load_ratio") is None):
-        # list: len = moe_layer_num, element is a tensor
-        mean_ratios = torch.cat(
-            [ratio.clone().detach().view(1) for ratio in my_probe.get("avg_load_ratio")])
-
-        torch.distributed.all_reduce(mean_ratios,
-                                    group=mpu.get_data_parallel_group())
-        
-        mean_ratios = mean_ratios / \
-            torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
-        
-        log_string += f' avg_load_ratio : {mean_ratios.tolist()}|'
+    #     log_string += f'\n max_load_ratio : {max_ratios.tolist()} (max), {mean_ratios.tolist()} (mean), {min_ratios.tolist()} (min)|'
 
     return log_string

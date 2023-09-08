@@ -377,140 +377,42 @@ def yyh_probe_reduce(probe_data_store):
         items_for_key = [x[key] for x in probe_data_store] # (value of minibatch1, value of minibatch2.....)
         final_my_probe[key] = items_for_key
 
-    ## merge top1_p
-    if not(final_my_probe.get('top1_p') is None):
-        moe_layer_num = len(final_my_probe['top1_p'][0])
-        all_layer_top1_p = []
-        for this_l_index in range(moe_layer_num):
-            temp_list = []
-            
-            for mini_batch_item in final_my_probe['top1_p']:
-                temp_list.append(mini_batch_item[this_l_index])
-            all_layer_top1_p.append(torch.cat(temp_list, dim=0))
+    # concatenate across different minibatch
+    log_keys = ['top1_p', 'max_load_ratio']
+    for this_key in log_keys:
+        if not(final_my_probe.get(this_key) is None):
+            moe_layer_num = len(final_my_probe[this_key][0])
+
+            all_layer_this_value = []
+            for this_l_index in range(moe_layer_num):
+                temp_list = []
+                
+                for mini_batch_item in final_my_probe[this_key]:
+                    temp_list.append(mini_batch_item[this_l_index])
+                all_layer_this_value.append(torch.cat(temp_list, dim=0))
+
+            final_my_probe[this_key] = all_layer_this_value
+
+    # avg across different minibatch
+    log_keys = ['non_zero_ratio', 'chosen_num', 'skip_ratio', 'token_no_choose_ratio', 
+                'one_expert_ratio', 'token_not_full_ratio', 'expert_not_full_ratio', 
+                'want_num', 'avg_load_ratio', "gate_time", "moe_time"]
     
-        final_my_probe['top1_p'] = all_layer_top1_p
+    for this_key in log_keys:
+        if not(final_my_probe.get(this_key) is None):
+            moe_layer_num = len(final_my_probe[this_key][0])
+            mini_batch_num = len(final_my_probe[this_key])
 
-    ## merge non_zero_ratio
-    if not(final_my_probe.get('non_zero_ratio') is None):
-        moe_layer_num = len(final_my_probe['non_zero_ratio'][0])
-        all_layer_non_zero_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['non_zero_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['non_zero_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_non_zero_ratio.append(temp_sum / len(final_my_probe['non_zero_ratio']))
-    
-        final_my_probe['non_zero_ratio'] = all_layer_non_zero_ratio
+            all_layer_this_value = []
+            for this_l_index in range(moe_layer_num):
+                temp_sum = final_my_probe[this_key][0][this_l_index]
 
-    if not(final_my_probe.get('chosen_num') is None):
-        moe_layer_num = len(final_my_probe['chosen_num'][0])
-        all_layer_chosen_num = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['chosen_num'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['chosen_num'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_chosen_num.append(temp_sum / len(final_my_probe['chosen_num']))
-
-        final_my_probe['chosen_num'] = all_layer_chosen_num
-
-    if not(final_my_probe.get('skip_ratio') is None):
-        moe_layer_num = len(final_my_probe['skip_ratio'][0])
-        all_layer_skip_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['skip_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['skip_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_skip_ratio.append(temp_sum / len(final_my_probe['skip_ratio']))
-
-        final_my_probe['skip_ratio'] = all_layer_skip_ratio
-
-    if not(final_my_probe.get('token_no_choose_ratio') is None):
-        moe_layer_num = len(final_my_probe['token_no_choose_ratio'][0])
-        all_layer_token_no_choose_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['token_no_choose_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['token_no_choose_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_token_no_choose_ratio.append(temp_sum / len(final_my_probe['token_no_choose_ratio']))
-
-        final_my_probe['token_no_choose_ratio'] = all_layer_token_no_choose_ratio
-
-
-    if not(final_my_probe.get('one_expert_ratio') is None):
-        moe_layer_num = len(final_my_probe['one_expert_ratio'][0])
-        all_layer_one_expert_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['one_expert_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['one_expert_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_one_expert_ratio.append(temp_sum / len(final_my_probe['one_expert_ratio']))
-
-        final_my_probe['one_expert_ratio'] = all_layer_one_expert_ratio
-    
-    if not(final_my_probe.get('token_not_full_ratio') is None):
-        moe_layer_num = len(final_my_probe['token_not_full_ratio'][0])
-        all_layer_token_not_full_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['token_not_full_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['token_not_full_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_token_not_full_ratio.append(temp_sum / len(final_my_probe['token_not_full_ratio']))
-
-        final_my_probe['token_not_full_ratio'] = all_layer_token_not_full_ratio
-
-    if not(final_my_probe.get('expert_not_full_ratio') is None):
-        moe_layer_num = len(final_my_probe['expert_not_full_ratio'][0])
-        all_layer_expert_not_full_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['expert_not_full_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['expert_not_full_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_expert_not_full_ratio.append(temp_sum / len(final_my_probe['expert_not_full_ratio']))
-
-        final_my_probe['expert_not_full_ratio'] = all_layer_expert_not_full_ratio
-
-    if not(final_my_probe.get('want_num') is None):
-        moe_layer_num = len(final_my_probe['want_num'][0])
-        all_layer_want_num = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['want_num'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['want_num'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_want_num.append(temp_sum / len(final_my_probe['want_num']))
-
-        final_my_probe['want_num'] = all_layer_want_num
-    
-    if not(final_my_probe.get('max_load_ratio') is None):
-        moe_layer_num = len(final_my_probe['max_load_ratio'][0])
-        all_layer_max_load_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['max_load_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['max_load_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_max_load_ratio.append(temp_sum / len(final_my_probe['max_load_ratio']))
-
-        final_my_probe['max_load_ratio'] = all_layer_max_load_ratio
-    
-    if not(final_my_probe.get('avg_load_ratio') is None):
-        moe_layer_num = len(final_my_probe['avg_load_ratio'][0])
-        all_layer_avg_load_ratio = []
-        for this_l_index in range(moe_layer_num):
-            temp_sum = final_my_probe['avg_load_ratio'][0][this_l_index]
-            
-            for mini_batch_item in final_my_probe['avg_load_ratio'][1:]:
-                temp_sum += mini_batch_item[this_l_index]
-            all_layer_avg_load_ratio.append(temp_sum / len(final_my_probe['avg_load_ratio']))
-
-        final_my_probe['avg_load_ratio'] = all_layer_avg_load_ratio
+                if mini_batch_num > 1:
+                    for mini_batch_item in final_my_probe[this_key][1:]:
+                        temp_sum += mini_batch_item[this_l_index]
+                all_layer_this_value.append(temp_sum / mini_batch_num)
+        
+            final_my_probe[this_key] = all_layer_this_value
     
     return final_my_probe
 

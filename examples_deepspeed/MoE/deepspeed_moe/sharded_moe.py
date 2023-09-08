@@ -201,14 +201,18 @@ def top1gating(logits: Tensor,
                noisy_gate_policy: Optional[str] = None,
                drop_tokens: bool = True,
                use_rts: bool = True,
-               use_tutel: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+               use_tutel: bool = False,
+               placeholder_expert: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements Top1Gating on logits."""
     if noisy_gate_policy == 'RSample':
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
 
-    capacity = _capacity(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
+    if placeholder_expert:
+        capacity = _capacity_plus_on(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
+    else:
+        capacity = _capacity(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
 
     # Create a mask for 1st's expert per token
     # noisy gating
@@ -234,6 +238,10 @@ def top1gating(logits: Tensor,
     ce = torch.mean(mask1.float(), dim=0)
     l_aux = torch.sum(me * ce) * num_experts
 
+    if placeholder_expert:
+        mask1 = mask1[:, 1:]
+        gates = gates[:, 1:]
+        
     # Random Token Selection
     if use_rts:
         uniform = exp_selection_uniform_map.get(logits.device)
@@ -255,6 +263,7 @@ def top1gating(logits: Tensor,
     mask1 = new_mask1
 
     if use_tutel:
+        raise Exception("yyh here use_tutel")
         # Tutel doesn't support index values masked with zero
         # so we need to replace masked indices with -1
         indices_mask = mask1.sum(dim=1) * num_experts - 1
@@ -291,9 +300,17 @@ def top1gating(logits: Tensor,
 
     dispatch_mask = combine_weights.bool()
 
-    gate_info = {
-        "expert_not_full_ratio": expert_not_full_ratio
+    if placeholder_expert:
+        skip_ratio = (indices1_s == 0).sum() / indices1_s.shape[0]
+        
+        gate_info = {
+        "expert_not_full_ratio": expert_not_full_ratio,
+        "skip_ratio": skip_ratio,
                  }
+    else:
+        gate_info = {
+            "expert_not_full_ratio": expert_not_full_ratio
+                    }
 
     return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
 
@@ -697,7 +714,7 @@ class TopKGate(Module):
         self.min_capacity = min_capacity
         self.noisy_gate_policy = noisy_gate_policy
         self.timers = SynchronizedWallClockTimer()
-        self.wall_clock_breakdown = False
+        self.wall_clock_breakdown = True
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
@@ -732,7 +749,7 @@ class TopKGate(Module):
         if self.k == 1:
             gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity, used_token, self.noisy_gate_policy if self.training else None,
-                                     self.drop_tokens, self.use_rts, use_tutel)
+                                     self.drop_tokens, self.use_rts, use_tutel, placeholder_expert=self.placeholder_expert)
 
         else:
             # gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
@@ -806,8 +823,8 @@ class MOELayer(Base):
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
 
-        if self.wall_clock_breakdown:
-            self.timers(MOE_TIMER).start()
+        # if self.wall_clock_breakdown:
+        self.timers(MOE_TIMER).start()
 
         # Implement Algorithm 2 from GShard paper.
         sequence_len = input[0].shape[0]
@@ -897,8 +914,11 @@ class MOELayer(Base):
 
         a = combined_output.reshape(input[0].shape)
 
-        if self.wall_clock_breakdown:
-            self.timers(MOE_TIMER).stop()
-            self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
+        # if self.wall_clock_breakdown:
+        self.timers(MOE_TIMER).stop()
+        self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
+
+        self.gate_info['gate_time'] = self.gate.gate_time
+        self.gate_info['moe_time'] = self.time_moe
 
         return a
