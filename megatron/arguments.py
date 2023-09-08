@@ -599,6 +599,8 @@ def _add_network_size_args(parser):
                            help='MoE Treshold')
     group.add_argument('--placeholder-expert', action='store_true',
                        default=False, help='If set, add a virtual expert means no process')
+    group.add_argument('--gate-view-num', type=int, default=1,
+                           help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--expert-interval', type=int, default=2,
                            help='Use experts in every "expert-interval" layers')
     group.add_argument('--hidden-size', type=int, default=None,

@@ -674,16 +674,18 @@ class TopKGate(Module):
                  drop_tokens: bool = True,
                  use_rts: bool = True,
                  threshold: float = -1.0,
-                 placeholder_expert: bool = False) -> None:
+                 placeholder_expert: bool = False,
+                 view_num: int = 1) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
         # if k != 1 and k != 2:
         #     raise ValueError('Only top-1 and top-2 gatings are supported.')
         self.placeholder_expert = placeholder_expert
+        self.view_num = view_num
         if placeholder_expert:
             num_experts += 1
-        self.wg = torch.nn.Linear(model_dim, num_experts, bias=False).float()
+        self.wg = torch.nn.Linear(model_dim, num_experts * view_num, bias=False).float()
         self.k = k
         self.capacity_factor = capacity_factor
         self.eval_capacity_factor = eval_capacity_factor
@@ -717,6 +719,10 @@ class TopKGate(Module):
             logits = self.wg(input_fp32)
         else:
             logits = in_logits
+
+        if self.view_num > 1:
+            logits = logits.reshape(logits.shape[0], -1, self.view_num)
+            logits = torch.max(logits, dim=-1)[0].contiguous()
 
         if self.k == 1:
             gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
