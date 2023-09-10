@@ -26,3 +26,4 @@ yyh_config/
 log/
 checkpoint/
 .idea/
+local_last_run.sh
