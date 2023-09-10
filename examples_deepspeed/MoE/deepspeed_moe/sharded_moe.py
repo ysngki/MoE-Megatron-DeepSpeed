@@ -264,6 +264,9 @@ def top1gating(logits: Tensor,
     new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
     mask1 = new_mask1
 
+    all_valid_chosen_num = mask1.sum()
+    avg_valid_chosen_num = all_valid_chosen_num / mask1.shape[0]
+
     if use_tutel:
         raise Exception("yyh here use_tutel")
         # Tutel doesn't support index values masked with zero
@@ -302,17 +305,15 @@ def top1gating(logits: Tensor,
 
     dispatch_mask = combine_weights.bool()
 
+    gate_info = {
+        "expert_not_full_ratio": expert_not_full_ratio,
+        "chosen_num": avg_valid_chosen_num,
+    }
+
     if placeholder_expert:
         skip_ratio = (indices1_s == 0).sum() / indices1_s.shape[0]
-        
-        gate_info = {
-        "expert_not_full_ratio": expert_not_full_ratio,
-        "skip_ratio": skip_ratio,
-                 }
-    else:
-        gate_info = {
-            "expert_not_full_ratio": expert_not_full_ratio
-                    }
+
+        gate_info["skip_ratio"] = skip_ratio
 
     return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
 
@@ -500,7 +501,8 @@ def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacit
 
     # threshold
     # gates_sorted, gates_indices = torch.sort(gates, dim=-1, descending=True)
-    explore_top_k_num = max(min(int(2 * k), num_experts), 1)
+    # explore_top_k_num = max(min(int(2 * k), num_experts), 1)
+    explore_top_k_num = num_experts
     gates_sorted, gates_indices = torch.topk(gates, dim=-1, k=explore_top_k_num, largest=True, sorted=True)
     
     cum_sorted_gates = torch.cumsum(gates_sorted, dim=-1)
@@ -509,29 +511,32 @@ def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacit
     whole_chosen_indices = chosen_flag * (gates_indices + 1) # (token num, explore_top_k_num) \in (0, actual_expert_num), 0 means not choose, 1 means choose placeholder expert (the first expert)
     skip_ratio = (whole_chosen_indices == 1).sum() / whole_chosen_indices.shape[0]
 
-    chosen_indices = torch.transpose(whole_chosen_indices, 0, 1)  # (explore_top_k_num, token_num)
+    # chosen_indices = torch.transpose(whole_chosen_indices, 0, 1)  # (explore_top_k_num, token_num)
 
     # get masks and capacity locations
-    # stop_index = chosen_indices.sum(dim=-1).ne(0).sum()
-    # stop_index = min(int(2 * capacity_factor), stop_index)
+    explore_top_k_num = whole_chosen_indices.sum(dim=0).ne(0).sum()
+    whole_chosen_indices = whole_chosen_indices[:, :explore_top_k_num] # (token num, explore_top_k_num)
 
-    # chosen_indices = chosen_indices[:stop_index] # (chosen_num, token_num)
+    whole_want_num = (whole_chosen_indices > 1).sum()
+    avg_want_num = whole_want_num / whole_chosen_indices.shape[0]
 
-    tensor_all_mask = F.one_hot(chosen_indices, num_classes=num_experts + 1)[:, :, 2:] # (explore_top_k_num, token_num, expert_num)
-    _, token_num, expert_num = tensor_all_mask.shape
-
-    tensor_all_mask = tensor_all_mask.view(-1, expert_num) # (chosen_num * token_num, expert_num)
+    scatter_importance = torch.arange(explore_top_k_num, 0, -1, device=whole_chosen_indices.device).expand(
+        whole_chosen_indices.shape)  # (token num, explore_top_k_num)
+    tensor_all_mask = torch.zeros((whole_chosen_indices.shape[0], num_experts + 1), device=whole_chosen_indices.device,
+                                  dtype=whole_chosen_indices.dtype).scatter_(1, whole_chosen_indices,
+                                                                             scatter_importance)[:,
+                      2:]  # (token num, expert_num)
+    token_num, expert_num = tensor_all_mask.shape
 
     # random token selection (ignore position)
     top_idx = _top_idx(tensor_all_mask, capacity)
     new_mask1 = tensor_all_mask * torch.zeros_like(tensor_all_mask).scatter_(0, top_idx, 1)
-    tensor_all_mask = new_mask1
+    tensor_all_mask = (new_mask1 > 0).int()
     # -------------------------------------------
 
-    tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0).view(-1, token_num, expert_num) - 1 # (chosen_num, token_num, expert_num)
-    tensor_all_mask = tensor_all_mask.reshape(-1, token_num, expert_num)
+    tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0) - 1 # (token_num, expert_num)
 
-    expert_received_num = tensor_all_locations[-1, -1, :] + 1
+    expert_received_num = tensor_all_locations[-1, :] + 1
     expert_not_full_ratio = (expert_received_num < capacity).sum() / expert_num # maybe near 100% since placeholder expert
 
     tensor_all_locations = tensor_all_locations * tensor_all_mask # (chosen_num, token_num, expert_num)
@@ -553,27 +558,20 @@ def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacit
     gates = gates[:, 1:]
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
 
-
-    tensor_all_mask = tensor_all_mask.sum(dim=0) # (token_num, expert_num)
-
     token_chosen_num = tensor_all_mask.sum(dim=-1) # (token_num)
     token_not_full_ratio = (token_chosen_num < capacity_factor).sum() / token_num
     token_no_expert_ratio = (token_chosen_num == 0).sum() / token_num
 
-    tensor_all_locations = tensor_all_locations.sum(dim=0) # (token_num, expert_num)
-    # tensor_all_mask = tensor_all_mask * torch.lt(tensor_all_locations, capacity)
+    all_valid_chosen_num = token_chosen_num.sum()
+    avg_valid_chosen_num = all_valid_chosen_num / token_num
 
     tensor_all_mask_float = tensor_all_mask.float()
     tensor_all_gates = gates * tensor_all_mask_float # (s, e)
-
 
     all_locations_sc = _one_hot_to_float(tensor_all_locations, capacity) # (s, e, c)
     combine_weights = all_locations_sc * tensor_all_gates.unsqueeze(-1) # (s, e, c)
 
     dispatch_mask = combine_weights.bool()
-
-    all_valid_chosen_num = tensor_all_mask.sum()
-    avg_valid_chosen_num = all_valid_chosen_num / token_num
 
     gate_info = {
         "top1_p": top1_p,
@@ -581,12 +579,13 @@ def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacit
         "skip_ratio": skip_ratio,
         "token_not_full_ratio": token_not_full_ratio,
         "token_no_choose_ratio": token_no_expert_ratio,
-        "expert_not_full_ratio": expert_not_full_ratio
+        "expert_not_full_ratio": expert_not_full_ratio,
+        "want_num": avg_want_num
                  }
     return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
 
 
-def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
 
@@ -618,10 +617,12 @@ def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: in
     whole_chosen_indices = chosen_flag * (gates_indices + 1) # (token num, explore_top_k_num) \in (0, expert_num + 1), 0 means not choose
 
     # get masks and capacity locations
-    stop_index = whole_chosen_indices.sum(dim=0).ne(0).sum()
-    whole_chosen_indices = whole_chosen_indices[:, :stop_index] # (token num, explore_top_k_num)
+    explore_top_k_num = whole_chosen_indices.sum(dim=0).ne(0).sum()
+    whole_chosen_indices = whole_chosen_indices[:, :explore_top_k_num] # (token num, explore_top_k_num)
 
-    explore_top_k_num = whole_chosen_indices.shape[1]
+    whole_want_num = (whole_chosen_indices > 0).sum()
+    avg_want_num = whole_want_num / whole_chosen_indices.shape[0]
+
     scatter_importance = torch.arange(explore_top_k_num, 0, -1, device=whole_chosen_indices.device).expand(whole_chosen_indices.shape) # (token num, explore_top_k_num)
     tensor_all_mask = torch.zeros((whole_chosen_indices.shape[0], num_experts + 1), device=whole_chosen_indices.device, dtype=whole_chosen_indices.dtype).scatter_(1, whole_chosen_indices, scatter_importance)[:, 1:] # (token num, expert_num)
     token_num, expert_num = tensor_all_mask.shape
@@ -672,7 +673,8 @@ def new_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: in
         "top1_p": top1_p,
         "chosen_num": avg_valid_chosen_num,
         "token_not_full_ratio": token_not_full_ratio,
-        "expert_not_full_ratio": expert_not_full_ratio
+        "expert_not_full_ratio": expert_not_full_ratio,
+        "want_num": avg_want_num
                  }
     return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
 
@@ -769,7 +771,7 @@ class TopKGate(Module):
                 gate_output = plus_one_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity, self.k, self.threshold)
             else:
-                gate_output = new_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                gate_output = main_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                         self.min_capacity, self.k, self.threshold)
 
         if self.wall_clock_breakdown:
