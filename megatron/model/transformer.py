@@ -112,9 +112,15 @@ class ParallelMLP(MegatronModule):
 
         in_hidden_size = args.hidden_size
         ffn_hidden_size = args.ffn_hidden_size
+
+        self.scale_moe = moe and args.scale_moe
         if moe:
             in_hidden_size = args.hidden_size // args.num_ffn_heads
             ffn_hidden_size = args.moe_ffn_hidden_size
+
+        if self.scale_moe:
+            self.dense_small_to_h = torch.nn.Linear(in_hidden_size // args.topk, in_hidden_size)
+            self.dense_h_to_small = torch.nn.Linear(in_hidden_size, in_hidden_size // args.topk)
 
         self.add_bias = config.add_bias_linear
 
@@ -172,6 +178,9 @@ class ParallelMLP(MegatronModule):
     
     def forward(self, hidden_states):
 
+        if self.scale_moe:
+            hidden_states = self.dense_small_to_h(hidden_states)
+
         # [s, b, 4hp]
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
@@ -190,6 +199,10 @@ class ParallelMLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+
+        if self.scale_moe:
+            output = self.dense_h_to_small(output)
+
         return output, output_bias, non_zero_ratio
 
 class SwitchMLP(MegatronModule):
@@ -1003,7 +1016,8 @@ class ParallelTransformerLayer(MegatronModule):
                                 enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
                                 threshold=args.threshold,
                                 placeholder_expert=args.placeholder_expert,
-                                view_num=args.gate_view_num)
+                                view_num=args.gate_view_num,
+                                scale_moe=args.scale_moe)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])

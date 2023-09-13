@@ -210,6 +210,7 @@ def top1gating(logits: Tensor,
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
+    top1_p, _ = torch.max(gates, dim=1)
 
     if placeholder_expert:
         capacity = _capacity_plus_on(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
@@ -305,9 +306,14 @@ def top1gating(logits: Tensor,
 
     dispatch_mask = combine_weights.bool()
 
+    token_chosen_num = mask1.sum(dim=-1)
+    token_not_full_ratio = (token_chosen_num < 1).sum() / token_chosen_num.shape[0]
+
     gate_info = {
         "expert_not_full_ratio": expert_not_full_ratio,
         "chosen_num": avg_valid_chosen_num,
+        "token_not_full_ratio": token_not_full_ratio,
+        "top1_p": top1_p
     }
 
     if placeholder_expert:
@@ -517,8 +523,8 @@ def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacit
     explore_top_k_num = whole_chosen_indices.sum(dim=0).ne(0).sum()
     whole_chosen_indices = whole_chosen_indices[:, :explore_top_k_num] # (token num, explore_top_k_num)
 
-    whole_want_num = (whole_chosen_indices > 1).sum()
-    avg_want_num = whole_want_num / whole_chosen_indices.shape[0]
+    each_token_want_num = (whole_chosen_indices > 1).sum(dim=-1)
+    avg_want_num = each_token_want_num.sum() / each_token_want_num.shape[0]
 
     scatter_importance = torch.arange(explore_top_k_num, 0, -1, device=whole_chosen_indices.device).expand(
         whole_chosen_indices.shape)  # (token num, explore_top_k_num)
@@ -559,7 +565,7 @@ def plus_one_thresholdGating(logits: Tensor, capacity_factor: float, min_capacit
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
 
     token_chosen_num = tensor_all_mask.sum(dim=-1) # (token_num)
-    token_not_full_ratio = (token_chosen_num < capacity_factor).sum() / token_num
+    token_not_full_ratio = (token_chosen_num < each_token_want_num).sum() / token_num
     token_no_expert_ratio = (token_chosen_num == 0).sum() / token_num
 
     all_valid_chosen_num = token_chosen_num.sum()
@@ -620,8 +626,8 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
     explore_top_k_num = whole_chosen_indices.sum(dim=0).ne(0).sum()
     whole_chosen_indices = whole_chosen_indices[:, :explore_top_k_num] # (token num, explore_top_k_num)
 
-    whole_want_num = (whole_chosen_indices > 0).sum()
-    avg_want_num = whole_want_num / whole_chosen_indices.shape[0]
+    each_token_want_num = (whole_chosen_indices > 0).sum(dim=1)
+    avg_want_num = each_token_want_num.sum() / each_token_want_num.shape[0]
 
     scatter_importance = torch.arange(explore_top_k_num, 0, -1, device=whole_chosen_indices.device).expand(whole_chosen_indices.shape) # (token num, explore_top_k_num)
     tensor_all_mask = torch.zeros((whole_chosen_indices.shape[0], num_experts + 1), device=whole_chosen_indices.device, dtype=whole_chosen_indices.dtype).scatter_(1, whole_chosen_indices, scatter_importance)[:, 1:] # (token num, expert_num)
@@ -656,7 +662,7 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
 
     token_chosen_num = tensor_all_mask.sum(dim=-1) # (token_num)
-    token_not_full_ratio = (token_chosen_num < capacity_factor).sum() / token_num
+    token_not_full_ratio = (token_chosen_num < each_token_want_num).sum() / token_num
 
     all_valid_chosen_num = token_chosen_num.sum()
     avg_valid_chosen_num = all_valid_chosen_num / token_num
@@ -709,7 +715,9 @@ class TopKGate(Module):
                  use_rts: bool = True,
                  threshold: float = -1.0,
                  placeholder_expert: bool = False,
-                 view_num: int = 1) -> None:
+                 view_num: int = 1,
+                 num_local_experts: int = 0,
+                 scale_moe: bool = False) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
@@ -732,6 +740,15 @@ class TopKGate(Module):
         self.use_rts = use_rts
 
         self.threshold = threshold
+        self.num_local_experts = num_local_experts
+
+        self.scale_moe = scale_moe
+        if self.scale_moe:
+            self.down_proj_1 = torch.nn.Linear(model_dim, model_dim // k).float()
+            # self.down_proj_2 = torch.nn.Linear(model_dim, model_dim // k).float()
+
+            # self.up_proj_1 = torch.nn.Linear(model_dim // k, model_dim).float()
+            self.up_proj_2 = torch.nn.Linear(model_dim // k, model_dim).float()
 
     def forward(self,
                 input: torch.Tensor,
@@ -889,6 +906,10 @@ class MOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers(FIRST_ALLTOALL_TIMER).start()
 
+        if self.gate.scale_moe:
+            dispatched_input = torch.nn.functional.gelu(self.gate.down_proj_1(dispatched_input))
+
+        temp_d_model = dispatched_input.shape[-1]
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
 
         if self.wall_clock_breakdown:
@@ -896,7 +917,7 @@ class MOELayer(Base):
             self.time_falltoall = self.timers(FIRST_ALLTOALL_TIMER).elapsed(reset=False)
 
         # Re-shape after all-to-all: ecm -> gecm
-        dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, d_model)
+        dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, temp_d_model)
 
         expert_output, non_zero_ratio = self.experts(dispatched_input)
         self.gate_info["non_zero_ratio"] = non_zero_ratio
@@ -905,6 +926,8 @@ class MOELayer(Base):
             self.timers(SECOND_ALLTOALL_TIMER).start()
 
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
+        if self.gate.scale_moe:
+            expert_output = self.gate.up_proj_2(torch.nn.functional.gelu(expert_output))
 
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()
