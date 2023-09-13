@@ -303,8 +303,7 @@ megatron_options=" \
         --moe-eval-capacity-factor ${MOE_EVAL_CAP_FACTOR} \
         --moe-min-capacity ${MOE_MIN_CAP} \
         --init-method-std ${INIT_STD} \
-        --lr-decay-tokens ${LR_DECAY_TOKENS} \
-        --lr-warmup-tokens ${WARMUP_TOKENS} \
+        --lr-warmup-fraction ${WARMUP_FRACTION} \
         --micro-batch-size ${BATCH_SIZE} \
         --exit-duration-in-mins ${EXIT_DURATION} \
         --global-batch-size ${GLOBAL_BATCH_SIZE} \
@@ -316,7 +315,6 @@ megatron_options=" \
         --num-ffn-heads ${NUM_FFN_HEADS} \
         --seq-length ${SEQ_LEN} \
         --max-position-embeddings ${SEQ_LEN} \
-        --train-tokens ${TRAIN_TOKENS} \
         --train-iters ${TRAIN_ITERS} \
         --lr ${LR} \
         --min-lr ${MIN_LR} \
