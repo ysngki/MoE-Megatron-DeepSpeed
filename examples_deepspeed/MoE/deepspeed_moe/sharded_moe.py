@@ -634,6 +634,9 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
     token_num, expert_num = tensor_all_mask.shape
 
     # random token selection (ignore position)
+    expert_received_num = (tensor_all_mask > 0).sum(dim=0)
+    receive_ratio = expert_received_num * 100 / token_num
+
     top_idx = _top_idx(tensor_all_mask, capacity) # (capacity, expert num)
     new_mask1 = tensor_all_mask * torch.zeros_like(tensor_all_mask).scatter_(0, top_idx, 1)
     tensor_all_mask = (new_mask1 > 0).int()
@@ -680,7 +683,8 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
         "chosen_num": avg_valid_chosen_num,
         "token_not_full_ratio": token_not_full_ratio,
         "expert_not_full_ratio": expert_not_full_ratio,
-        "want_num": avg_want_num
+        "want_num": avg_want_num,
+        "receive_ratio": receive_ratio
                  }
     return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
 

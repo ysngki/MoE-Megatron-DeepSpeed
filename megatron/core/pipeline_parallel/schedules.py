@@ -415,7 +415,7 @@ def yyh_probe_reduce(probe_data_store):
     # avg across different minibatch
     log_keys = ['non_zero_ratio', 'chosen_num', 'skip_ratio', 'token_no_choose_ratio', 
                 'one_expert_ratio', 'token_not_full_ratio', 'expert_not_full_ratio', 
-                'want_num', 'avg_load_ratio']
+                'want_num', 'receive_ratio']
     
     for this_key in log_keys:
         if not(final_my_probe.get(this_key) is None):

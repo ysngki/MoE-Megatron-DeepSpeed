@@ -1525,19 +1525,21 @@ def build_train_valid_test_data_iterators(
 
 def yyh_update_log_string(my_probe, log_string):
     # add my_probe
-    if not(my_probe.get("top1_p") is None):
-        # this_layer_tokens = torch.cat(my_probe['top1_p'], dim=0)
-        for this_layer_tokens in my_probe['top1_p']:
-            max_p = torch.max(this_layer_tokens)
-            min_p = torch.min(this_layer_tokens)
-            mean_p = torch.mean(this_layer_tokens)
-            median_p = torch.median(this_layer_tokens)
+    for key in ["top1_p", "receive_ratio"]:
+        if not(my_probe.get(key) is None):
+            # this_layer_tokens = torch.cat(my_probe['top1_p'], dim=0)
+            log_string += "\n"
+            for this_layer_tokens in my_probe[key]:
+                max_p = torch.max(this_layer_tokens)
+                min_p = torch.min(this_layer_tokens)
+                mean_p = torch.mean(this_layer_tokens)
+                median_p = torch.median(this_layer_tokens)
 
-            last_quantile = torch.quantile(this_layer_tokens, 0.25)
-            first_quantile = torch.quantile(this_layer_tokens, 0.75)
+                last_quantile = torch.quantile(this_layer_tokens, 0.25)
+                first_quantile = torch.quantile(this_layer_tokens, 0.75)
 
-            log_string += '| top1-max-min-mean-median-25\%-75\%: {:3f}, {:3f}, {:3f}, {:3f}, {:3f}, {:3f} |'.format(
-            max_p, min_p, mean_p, median_p, last_quantile, first_quantile)
+                log_string += '|{} (max-min-mean-median-25\%-75\%): {:3f}, {:3f}, {:3f}, {:3f}, {:3f}, {:3f} |'.format(
+                key, max_p, min_p, mean_p, median_p, last_quantile, first_quantile)
 
     log_tensor_list = []
     log_tensor_len_list = []
