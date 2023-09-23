@@ -596,13 +596,15 @@ def _add_network_size_args(parser):
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--threshold', type=float, default=-1.0,
-                           help='MoE Treshold')
+                           help='MoE Treshold (added by yyh)')
+    group.add_argument('--sparse-mlp', action='store_true',
+                       default=False, help='If set, use my spare mlp to replace the mlp in moe layer (added by yyh)')
     group.add_argument('--placeholder-expert', action='store_true',
-                       default=False, help='If set, add a virtual expert means no process')
+                       default=False, help='If set, add a virtual expert means no process (added by yyh)')
     group.add_argument('--gate-view-num', type=int, default=1,
-                           help='Sets the k in TopK gating for MoE layers')
+                           help='Sets the k in TopK gating for MoE layers (added by yyh)')
     group.add_argument('--scale-moe', action='store_true',
-                       help='scale the shape of moe layer to reduce communication cost.')
+                       help='scale the shape of moe layer to reduce communication cost. (added by yyh)')
     group.add_argument('--expert-interval', type=int, default=2,
                            help='Use experts in every "expert-interval" layers')
     group.add_argument('--hidden-size', type=int, default=None,
@@ -612,7 +614,7 @@ def _add_network_size_args(parser):
                        'This is set to 4*hidden-size if not provided')
     group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
                        help='MoE Layer\'s Feed-Forward Network hidden size. '
-                       'This is set to ffn-hidden-size if not provided')
+                       'This is set to ffn-hidden-size if not provided (added by yyh)')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--num-ffn-heads', type=int, default=1,

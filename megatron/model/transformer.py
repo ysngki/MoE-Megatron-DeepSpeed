@@ -22,6 +22,9 @@ import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
 
+from .mlp_gating import Experts, main_thresholdGating
+from deepspeed.moe.sharded_moe import TopKGate
+
 try:
     from deepspeed.sequence.layer import DistributedAttention
     dist_attn_supported = True
@@ -97,6 +100,70 @@ class DropPath(MegatronModule):
         random_tensor.floor_()  # binarize
         output = hidden_state.div(keep_prob) * random_tensor
         return output
+
+
+class SpareMLP(torch.nn.Module):
+    """MLP.
+
+    MLP will take the input with h hidden state, project it to 4*h
+    hidden dimension, perform nonlinear transformation, and project the
+    state back into h hidden dimension.
+    """
+
+    def __init__(self,
+                 hidden_size,
+                 expert,
+                 num_experts=1,
+                 ep_size=1,
+                 k=1,
+                 capacity_factor=1.,
+                 eval_capacity_factor=1.,
+                 min_capacity=4,
+                 use_residual=False,
+                 noisy_gate_policy: Optional[str] = None,
+                 drop_tokens: bool = True,
+                 use_rts=True,
+                 use_tutel: bool = False,
+                 enable_expert_tensor_parallelism: bool = False,
+                 threshold: float = -1.0,
+                 placeholder_expert: bool = False,
+                 view_num: int = 1,
+                 scale_moe: bool = False):
+        # most of arg is unused since this is a simplified MoE
+        super(SpareMLP, self).__init__()
+
+        self.num_experts = num_experts
+        self.num_local_experts = num_experts
+
+        self.experts = Experts(expert, num_experts)
+        self.gate = TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
+                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, threshold=threshold,
+                               placeholder_expert=placeholder_expert, view_num=view_num,
+                               num_local_experts=self.num_local_experts, scale_moe=scale_moe)
+
+        self.gating_function = main_thresholdGating
+
+    def forward(self, hidden_states, now_training_process):
+
+        sequence_len = hidden_states.shape[0]
+        d_model = hidden_states.shape[-1]
+
+        reshaped_input = hidden_states.reshape(-1, d_model)
+
+        l_aux, combine_weights, dispatch_mask, exp_counts, gate_info = self.gate(reshaped_input,
+                                                                                    None,
+                                                                                    in_logits=None,
+                                                                                    now_training_process=None,
+                                                                                    gating_function=self.gating_function)
+
+        expert_output, non_zero_ratio = self.experts(reshaped_input, combine_weights)
+
+        gate_info["non_zero_ratio"] = non_zero_ratio
+
+        output = expert_output.reshape(hidden_states.shape)
+
+        return output, l_aux, exp_counts, gate_info
+
 
 class ParallelMLP(MegatronModule):
     """MLP.
@@ -1001,23 +1068,43 @@ class ParallelTransformerLayer(MegatronModule):
                 self.mlp = ParallelMLP(config)
             else: # DeepSpeed's MoE
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
-                self.mlp = MoE(args.hidden_size,
-                                ParallelMLP(config,
-                                    moe=True,
-                                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
-                                num_experts=self.num_experts,
-                                ep_size=args.moe_expert_parallel_size,
-                                k=args.topk,
-                                use_residual=(args.mlp_type == 'residual'),
-                                capacity_factor=args.moe_train_capacity_factor,
-                                eval_capacity_factor=args.moe_eval_capacity_factor,
-                                min_capacity=args.moe_min_capacity,
-                                drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
-                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
-                                threshold=args.threshold,
-                                placeholder_expert=args.placeholder_expert,
-                                view_num=args.gate_view_num,
-                                scale_moe=args.scale_moe)
+
+                if args.sparse_mlp:
+                    self.mlp = SpareMLP(args.hidden_size,
+                                   ParallelMLP(config,
+                                               moe=True,
+                                               enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
+                                   num_experts=self.num_experts,
+                                   ep_size=args.moe_expert_parallel_size,
+                                   k=args.topk,
+                                   use_residual=(args.mlp_type == 'residual'),
+                                   capacity_factor=args.moe_train_capacity_factor,
+                                   eval_capacity_factor=args.moe_eval_capacity_factor,
+                                   min_capacity=args.moe_min_capacity,
+                                   drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
+                                   enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
+                                   threshold=args.threshold,
+                                   placeholder_expert=args.placeholder_expert,
+                                   view_num=args.gate_view_num,
+                                   scale_moe=args.scale_moe)
+                else:
+                    self.mlp = MoE(args.hidden_size,
+                                    ParallelMLP(config,
+                                        moe=True,
+                                        enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
+                                    num_experts=self.num_experts,
+                                    ep_size=args.moe_expert_parallel_size,
+                                    k=args.topk,
+                                    use_residual=(args.mlp_type == 'residual'),
+                                    capacity_factor=args.moe_train_capacity_factor,
+                                    eval_capacity_factor=args.moe_eval_capacity_factor,
+                                    min_capacity=args.moe_min_capacity,
+                                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
+                                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
+                                    threshold=args.threshold,
+                                    placeholder_expert=args.placeholder_expert,
+                                    view_num=args.gate_view_num,
+                                    scale_moe=args.scale_moe)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -1355,6 +1442,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         if self.num_experts == 1:
             mlp_output, mlp_bias, non_zero_ratio = self.mlp(layernorm_output)
+            my_probe["non_zero_ratio"] = non_zero_ratio
         else:
             args = get_args()
 
@@ -2024,8 +2112,12 @@ class ParallelTransformer(MegatronModule):
                             if not self.ds_inference:
                                 hidden_states, moe_loss, this_probe = hidden_states
                                 moe_losses.append(moe_loss)
-                                if len(this_probe.keys()) > 0:
-                                    all_layer_probes.append(this_probe)
+                                args = get_args()
+                                # if this is moe layer, we need to save the probe;
+                                # if dense layer at specific position, we need to save the probe
+                                if layer.num_experts > 1 or (index + 1) % args.expert_interval == 0:
+                                    if len(this_probe.keys()) > 0:
+                                        all_layer_probes.append(this_probe)
 
                             # assert (len(hidden_states) == 2 or len(hidden_states) == 3)
                             # if len(hidden_states) == 2:

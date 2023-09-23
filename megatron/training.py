@@ -1568,6 +1568,9 @@ def yyh_update_log_string(my_probe, log_string):
             valid_key_names.append(log_print_keys[index])     
 
     # concatenate then gather
+    if len(log_tensor_list) == 0:
+        return log_string
+
     whole_log_value_tensor = torch.cat(log_tensor_list)
     torch.distributed.all_reduce(whole_log_value_tensor,
                                     group=mpu.get_data_parallel_group())

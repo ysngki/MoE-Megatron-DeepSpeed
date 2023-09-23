@@ -459,6 +459,9 @@ class TransformerLanguageModel(MegatronModule):
         else:
             self.decoder = None
 
+        if self.add_encoder and self.add_decoder:
+            raise Exception("yyh here!! Use both encoder and decoder!")
+
         if self.post_process:
             # Pooler.
             if self.add_pooler:
@@ -563,9 +566,12 @@ class TransformerLanguageModel(MegatronModule):
         # similarity between two sequences by average pooling
         if not self.add_decoder or output_enc_hidden:
             if self.add_pooler and self.post_process:
+                raise Exception("yyh here output_enc_hidden!!!!")
                 return encoder_output, pooled_output, encoder_moe_losses
             else:
                 return encoder_output, my_probe, encoder_moe_losses
+
+        raise Exception("yyh here!! use both encoder and decoder!!")
 
         # Decoder embedding.
         if self.pre_process:

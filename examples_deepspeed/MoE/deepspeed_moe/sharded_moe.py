@@ -759,7 +759,8 @@ class TopKGate(Module):
                 used_token: torch.Tensor = None,
                 use_tutel: bool = False,
                 in_logits: torch.Tensor = None,
-                now_training_process: float = None) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
+                now_training_process: float = None,
+                gating_function = None) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
 
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).start()
@@ -779,21 +780,27 @@ class TopKGate(Module):
             logits = logits.reshape(logits.shape[0], -1, self.view_num)
             logits = torch.max(logits, dim=-1)[0].contiguous()
 
-        if self.k == 1:
-            gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-                                     self.min_capacity, used_token, self.noisy_gate_policy if self.training else None,
-                                     self.drop_tokens, self.use_rts, use_tutel, placeholder_expert=self.placeholder_expert)
-
+        if gating_function is not None:
+            gate_output = gating_function(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                                            self.min_capacity, self.k, self.threshold)
         else:
-            # gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-            #                          self.min_capacity)
+            if self.k == 1:
+                gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                                         self.min_capacity, used_token, self.noisy_gate_policy if self.training else None,
+                                         self.drop_tokens, self.use_rts, use_tutel, placeholder_expert=self.placeholder_expert)
 
-            if self.placeholder_expert:
-                gate_output = plus_one_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-                                     self.min_capacity, self.k, self.threshold)
             else:
-                gate_output = main_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-                                        self.min_capacity, self.k, self.threshold)
+                # gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                #                          self.min_capacity)
+                # gate_output = topkgating(logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.k,
+                #                          self.min_capacity)
+
+                if self.placeholder_expert:
+                    gate_output = plus_one_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                                         self.min_capacity, self.k, self.threshold)
+                else:
+                    gate_output = main_thresholdGating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+                                            self.min_capacity, self.k, self.threshold)
 
         if self.wall_clock_breakdown:
             self.timers(TOPK_GATE_TIMER).stop()
