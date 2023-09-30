@@ -620,7 +620,7 @@ class TransformerLanguageModel(MegatronModule):
             # If components other than encoder may contain MoE states, need to add
             # the same logic
             for key in list(encoder_state_dict.keys()):
-                if 'expert' in key and 'moe.gate.wg.weight' not in key:
+                if 'expert' in key and 'moe.gate.wg.weight' not in key and 'yyh_local' not in key:
                     moe_state_dict[self._encoder_key+key] = encoder_state_dict.pop(key)
             state_dict_[self._encoder_key] = encoder_state_dict
 
