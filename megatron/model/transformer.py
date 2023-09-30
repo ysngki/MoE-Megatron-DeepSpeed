@@ -1088,6 +1088,7 @@ class ParallelTransformerLayer(MegatronModule):
                                    view_num=args.gate_view_num,
                                    scale_moe=args.scale_moe)
                 else:
+                    raise Exception("yyh here using Deepspeed MoE!")
                     self.mlp = MoE(args.hidden_size,
                                     ParallelMLP(config,
                                         moe=True,
