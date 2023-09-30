@@ -29,14 +29,17 @@ class Experts(torch.nn.Module):
 	def __init__(self, expert, num_local_experts=1):
 		super(Experts, self).__init__()
 
-		self.deepspeed_experts = torch.nn.ModuleList([copy.deepcopy(expert) for _ in range(num_local_experts)])
+		self.yyh_local_experts = torch.nn.ModuleList([copy.deepcopy(expert) for _ in range(num_local_experts)])
 
-	def forward(self, inputs, inputs_weight):
+	def forward(self, inputs, inputs_weight, top_idx):
 		# inputs: (s, m), inputs_weight: (s, e)
-		expert_output = None
+		expert_output = torch.zeros_like(inputs)
 		out_non_zero_ratio = None
-		for e_idx, expert in enumerate(self.deepspeed_experts):
-			out = expert(inputs)
+		for e_idx, expert in enumerate(self.yyh_local_experts):
+			token_idx = top_idx[:, e_idx]  # (capacity)
+			these_tokens = inputs[token_idx]  # (capacity, dim)
+
+			out = expert(these_tokens)
 
 			if type(out) is tuple:
 				if out_non_zero_ratio is None:
@@ -46,12 +49,9 @@ class Experts(torch.nn.Module):
 
 				out = out[0]  # Ignore the bias term for now
 
-			if expert_output is None:
-				expert_output = out * inputs_weight[:, e_idx].unsqueeze(-1).type_as(inputs)
-			else:
-				expert_output += out * inputs_weight[:, e_idx].unsqueeze(-1).type_as(inputs)
+			expert_output[token_idx] += out * inputs_weight[:, e_idx][token_idx].unsqueeze(-1).type_as(inputs)
 
-		return expert_output, out_non_zero_ratio / len(self.deepspeed_experts)
+		return expert_output, out_non_zero_ratio / len(self.yyh_local_experts)
 
 
 def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[
@@ -157,4 +157,4 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
 		"want_num": avg_want_num,
 		"receive_ratio": receive_ratio
 	}
-	return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info
+	return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx

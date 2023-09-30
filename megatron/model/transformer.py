@@ -102,7 +102,7 @@ class DropPath(MegatronModule):
         return output
 
 
-class SpareMLP(torch.nn.Module):
+class SparseMLP(torch.nn.Module):
     """MLP.
 
     MLP will take the input with h hidden state, project it to 4*h
@@ -130,7 +130,7 @@ class SpareMLP(torch.nn.Module):
                  view_num: int = 1,
                  scale_moe: bool = False):
         # most of arg is unused since this is a simplified MoE
-        super(SpareMLP, self).__init__()
+        super(SparseMLP, self).__init__()
 
         self.num_experts = num_experts
         self.num_local_experts = num_experts
@@ -150,13 +150,13 @@ class SpareMLP(torch.nn.Module):
 
         reshaped_input = hidden_states.reshape(-1, d_model)
 
-        l_aux, combine_weights, dispatch_mask, exp_counts, gate_info = self.gate(reshaped_input,
+        l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx = self.gate(reshaped_input,
                                                                                     None,
                                                                                     in_logits=None,
                                                                                     now_training_process=None,
                                                                                     gating_function=self.gating_function)
 
-        expert_output, non_zero_ratio = self.experts(reshaped_input, combine_weights)
+        expert_output, non_zero_ratio = self.experts(reshaped_input, combine_weights, top_idx)
 
         gate_info["non_zero_ratio"] = non_zero_ratio
 
@@ -1070,7 +1070,7 @@ class ParallelTransformerLayer(MegatronModule):
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
 
                 if args.sparse_mlp:
-                    self.mlp = SpareMLP(args.hidden_size,
+                    self.mlp = SparseMLP(args.hidden_size,
                                    ParallelMLP(config,
                                                moe=True,
                                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
