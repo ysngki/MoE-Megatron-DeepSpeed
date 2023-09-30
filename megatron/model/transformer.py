@@ -10,7 +10,7 @@ from typing import Optional
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
 from .module import MegatronModule
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel, mpu
 from megatron.core.enums import ModelType
 from megatron.model import LayerNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
@@ -61,7 +61,6 @@ try:
     from apex.normalization import MixedFusedRMSNorm
 except ImportError:
     MixedFusedRMSNorm = None
-
 
 
 """ We use the following notation throughout this file:
@@ -242,7 +241,7 @@ class ParallelMLP(MegatronModule):
 
     def get_key_weight(self):
         return self.dense_h_to_4h.weight.mean(dim=0, keepdim=True)  # (1, input_dim)
-    
+
     def forward(self, hidden_states):
 
         if self.scale_moe:
@@ -480,8 +479,9 @@ class FlashSelfAttention(torch.nn.Module):
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
 
-        # Use FlashAttention-2 when available
-        self.flash_attn_func = flash_attn_unpadded_func if flash_attn_varlen_func is None else flash_attn_varlen_func
+        # Use FlashAttention-2 when args.use_flash_attn_v2 is True
+        args = get_args()
+        self.flash_attn_func = flash_attn_varlen_func if args.use_flash_attn_v2 else flash_attn_unpadded_func
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -591,14 +591,18 @@ class ParallelAttention(MegatronModule):
         self.num_key_value_heads = config.num_key_value_heads
         self.use_gqa = (self.num_attention_heads != self.num_key_value_heads)
 
-        self.use_flash_attn = (args.use_flash_attn or args.use_flash_attn_triton) \
+        self.use_flash_attn = (args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2) \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
         self.use_flash_attn_triton = args.use_flash_attn_triton
         if self.use_flash_attn:
-            if flash_attn_unpadded_func is None and flash_attn_varlen_func is None and flash_attn_builder is None:
-                raise ImportError('FlashAttention is not installed, please install with '
-                                  'pip install flash-attn or or implement your own flash attention')
+            if args.use_flash_attn_v1:
+                assert flash_attn_unpadded_func != None, "Cannot import FlashAttention v1 "
+            if args.use_flash_attn_v2:
+                assert flash_attn_varlen_func != None, "Cannot import FlashAttention v2 "
+            if args.use_flash_attn_triton:
+                assert flash_attn_func != None, "Cannot import FlashAttention triton "
+
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
                                                           'self-attention for now')
             assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
@@ -699,10 +703,6 @@ class ParallelAttention(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True)
 
-        if deepspeed.checkpointing.is_configured():
-            global get_cuda_rng_tracker, checkpoint
-            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
-            checkpoint = deepspeed.checkpointing.checkpoint
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
@@ -1858,11 +1858,7 @@ class ParallelTransformer(MegatronModule):
                         eps=config.layernorm_epsilon)
             else:
                 self.final_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
-        if deepspeed.checkpointing.is_configured():
-            global get_cuda_rng_tracker, checkpoint
-            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
-            checkpoint = deepspeed.checkpointing.checkpoint
-    
+
     def update_threshold(self, new_threshold):
         for index in range(self.num_layers):
             layer = self._get_layer(index)
@@ -1883,12 +1879,17 @@ class ParallelTransformer(MegatronModule):
                 moe_losses = []
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_, moe_loss = layer(x_, *args, **kwargs)
+                    output = layer(x_, *args, **kwargs)
+                    if isinstance(output, tuple):
+                        x_, moe_loss = output
+                    else:
+                        x_ = output
+                        moe_loss = torch.tensor(0.0, device=x_.device, dtype=x_.dtype, requires_grad=True)
                     moe_losses.append(moe_loss)
                 return (x_, *moe_losses)
             return custom_forward
         
-        if args.deepspeed:
+        if args.deepspeed and args.deepspeed_activation_checkpointing:
             moe_losses = []
             # Make sure memory is freed.
             tensor_parallel.reset_checkpointed_activations_memory_buffer()
@@ -2130,7 +2131,7 @@ class ParallelTransformer(MegatronModule):
                             #     if not self.ds_inference:
                             #         hidden_states, _, moe_loss = hidden_states
                             #         moe_losses.append(moe_loss)
-                    
+
                     if len(all_layer_probes) > 0:
                         for key in all_layer_probes[0]:
                             items_for_key = [x[key] for x in all_layer_probes]
