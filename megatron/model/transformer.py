@@ -22,8 +22,8 @@ import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
 
-from .mlp_gating import Experts, main_thresholdGating
-from deepspeed.moe.sharded_moe import TopKGate
+from .mlp_gating import Experts, main_thresholdGating, TopKGate
+# from deepspeed.moe.sharded_moe import TopKGate
 
 try:
     from deepspeed.sequence.layer import DistributedAttention

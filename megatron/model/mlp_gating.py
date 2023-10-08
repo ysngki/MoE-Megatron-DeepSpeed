@@ -436,6 +436,7 @@ class TopKGate(torch.nn.Module):
 			logits = logits.reshape(logits.shape[0], -1, self.view_num)
 			logits = torch.max(logits, dim=-1)[0].contiguous()
 
+		gating_function = None
 		if gating_function is not None:
 			gate_output = gating_function(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
 										  self.min_capacity, self.k, self.threshold)
@@ -454,6 +455,7 @@ class TopKGate(torch.nn.Module):
 				#                          self.min_capacity)
 
 				if self.placeholder_expert:
+					raise Exception("Not supported yet!")
 					gate_output = plus_one_thresholdGating(logits,
 														   self.capacity_factor if self.training else self.eval_capacity_factor,
 														   self.min_capacity, self.k, self.threshold)
