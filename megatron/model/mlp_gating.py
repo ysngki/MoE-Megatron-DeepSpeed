@@ -244,6 +244,75 @@ def top1gating(logits: Tensor,
 	return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx
 
 
+def topkgating(logits: Tensor, capacity_factor: float, min_capacity: int, in_k: int) -> Tuple[
+	Tensor, Tensor, Tensor, Tensor]:
+	# everything is in fp32 in this function
+	gates = F.softmax(logits, dim=1)
+	top1_p, _ = torch.max(gates, dim=1)
+
+	capacity = _capacity(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
+
+	# Create a mask for 1st's expert per token
+	indices1_s = torch.argmax(gates, dim=1)
+	num_experts = int(gates.shape[1])
+	mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+	# gating decisions (no use)
+	exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+
+	# select remaining (k-1) experts
+	logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
+	# Replace top-expert with min value
+	logits_except1 = logits_w_noise.masked_fill(mask1.bool(), float("-inf"))
+
+	_, gates_indices = torch.topk(logits_except1, dim=-1, k=in_k-1, largest=True, sorted=True)
+	whole_chosen_indices = torch.cat([indices1_s.unsqueeze(-1), gates_indices], dim=-1) # (token num, in_k)
+
+
+	scatter_importance = torch.arange(in_k, 0, -1, device=whole_chosen_indices.device).expand(
+		whole_chosen_indices.shape)  # (token num, in_k)
+	tensor_all_mask = torch.zeros((whole_chosen_indices.shape[0], num_experts), device=whole_chosen_indices.device,
+								  dtype=whole_chosen_indices.dtype).scatter_(1, whole_chosen_indices,
+																			 scatter_importance) # (token num, expert_num)
+	token_num, expert_num = tensor_all_mask.shape
+
+	expert_received_num = (tensor_all_mask > 0).sum(dim=0)
+	receive_ratio = expert_received_num * 100 / token_num
+
+	top_idx = _top_idx(tensor_all_mask, capacity)  # (capacity, expert num)
+	new_mask1 = tensor_all_mask * torch.zeros_like(tensor_all_mask).scatter_(0, top_idx, 1)
+	tensor_all_mask = (new_mask1 > 0).int()
+	# -------------------------------------------
+	expert_actual_received_num = tensor_all_mask.sum(dim=0)
+	expert_not_full_ratio = (expert_actual_received_num < capacity).sum() / expert_num
+
+	# Compute l_aux  !!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+	me = torch.mean(gates, dim=0)
+	ce = torch.mean(mask1.float(), dim=0)
+	l_aux = torch.sum(me * ce) * num_experts
+	# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+
+	token_chosen_num = tensor_all_mask.sum(dim=-1)  # (token_num)
+	token_not_full_ratio = (token_chosen_num < in_k).sum() / token_num
+
+	all_valid_chosen_num = token_chosen_num.sum()
+	avg_valid_chosen_num = all_valid_chosen_num / token_num
+
+	tensor_all_mask_float = tensor_all_mask.float()
+	tensor_all_gates = gates * tensor_all_mask_float  # (s, e)
+	combine_weights = tensor_all_gates
+	dispatch_mask = None  # no used actually
+
+	gate_info = {
+		"top1_p": top1_p,
+		"chosen_num": avg_valid_chosen_num,
+		"token_not_full_ratio": token_not_full_ratio,
+		"expert_not_full_ratio": expert_not_full_ratio,
+		"receive_ratio": receive_ratio
+	}
+	return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx
+
+
 def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[
 	Tensor, Tensor, Tensor, Tensor]:
 	# everything is in fp32 in this function
@@ -449,10 +518,8 @@ class TopKGate(torch.nn.Module):
 										 placeholder_expert=self.placeholder_expert)
 
 			else:
-				# gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-				#                          self.min_capacity)
-				# gate_output = topkgating(logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.k,
-				#                          self.min_capacity)
+				# gate_output = topkgating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+				# 						 self.min_capacity, self.k)
 
 				if self.placeholder_expert:
 					raise Exception("Not supported yet!")
