@@ -210,7 +210,11 @@ class ParallelMLP(MegatronModule):
         self.activation_func = None
         self.swiglu = args.swiglu
 
-        if args.openai_gelu:
+        if args.yyh_relu:
+            def vanilla_relu(x):
+                return F.relu(x)
+            self.activation_func = vanilla_relu
+        elif args.openai_gelu:
             self.activation_func = openai_gelu
         elif args.onnx_safe:
             self.activation_func = erf_gelu

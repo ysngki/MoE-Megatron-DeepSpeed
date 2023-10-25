@@ -587,6 +587,8 @@ def _add_network_size_args(parser):
                            help='number of experts list, MoE related.')
     group.add_argument('--mlp-type', type=str, default='standard',
                            help='Only applicable when num-experts > 1, accepts [standard, residual]')
+    group.add_argument('--yyh-relu', action='store_true',
+                       default=False, help='If set, use relu')
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--threshold', type=float, default=-1.0,
