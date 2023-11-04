@@ -22,7 +22,7 @@ import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
 
-from .mlp_gating import Experts, main_thresholdGating, TopKGate
+from .mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
 # from deepspeed.moe.sharded_moe import TopKGate
 
 try:
@@ -131,33 +131,46 @@ class SparseMLP(torch.nn.Module):
         # most of arg is unused since this is a simplified MoE
         super(SparseMLP, self).__init__()
 
+        args = get_args()
+        self.use_base_layer = args.use_base_layer
+        self.use_topk = args.use_topk
+        self.use_threshold = args.use_threshold
+        self.use_hash_layer = args.use_hash_layer
+
         self.num_experts = num_experts
         self.num_local_experts = num_experts
 
         self.experts = Experts(expert, num_experts)
-        self.gate = TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
-                               min_capacity, noisy_gate_policy, drop_tokens, use_rts, threshold=threshold,
-                               placeholder_expert=placeholder_expert, view_num=view_num,
-                               num_local_experts=self.num_local_experts, scale_moe=scale_moe)
+        if self.use_hash_layer:
+            self.gate = HashRouter(num_experts, args.padded_vocab_size, capacity_factor, eval_capacity_factor, min_capacity)
+        else:
+            self.gate = TopKGate(hidden_size, num_experts, k, capacity_factor, eval_capacity_factor,
+                                   min_capacity, noisy_gate_policy, drop_tokens, use_rts, threshold=threshold,
+                                   placeholder_expert=placeholder_expert, view_num=view_num,
+                                   num_local_experts=self.num_local_experts, scale_moe=scale_moe)
 
         self.gating_function = main_thresholdGating
 
-    def forward(self, hidden_states, now_training_process):
-        args = get_args()
-
-        sequence_len = hidden_states.shape[0]
-        d_model = hidden_states.shape[-1]
+    def forward(self, hidden_states, now_training_process, enc_input_ids=None):
+        sequence_len, bsz_size, d_model = hidden_states.shape
 
         reshaped_input = hidden_states.reshape(-1, d_model)
 
-        l_aux, combine_weights, _, exp_counts, gate_info, top_idx = self.gate(reshaped_input,
-                                                                                    None,
-                                                                                    in_logits=None,
-                                                                                    now_training_process=None,
-                                                                                    gating_function=None,
-                                                                                    use_base_layer=args.use_base_layer,
-                                                                                    use_topk=args.use_topk,
-                                                                                    use_threshold=args.use_threshold)
+        if self.use_hash_layer:
+            enc_input_ids = enc_input_ids.t().reshape(-1) # (bsz, seq_len) -> (seq_len, bsz) -> (seq_len * bsz,)
+            combine_weights, gate_info, top_idx = self.gate(enc_input_ids)
+
+            exp_counts = None
+            l_aux = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        else:
+            l_aux, combine_weights, _, exp_counts, gate_info, top_idx = self.gate(reshaped_input,
+                                                                                        None,
+                                                                                        in_logits=None,
+                                                                                        now_training_process=None,
+                                                                                        gating_function=None,
+                                                                                        use_base_layer=self.use_base_layer,
+                                                                                        use_topk=self.use_topk,
+                                                                                        use_threshold=self.use_threshold)
 
         expert_output, non_zero_ratio = self.experts(reshaped_input, combine_weights, top_idx)
 
@@ -1360,7 +1373,8 @@ class ParallelTransformerLayer(MegatronModule):
                 retriever_output=None,
                 retriever_attn_mask=None,
                 inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None,
+                enc_input_ids=None):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -1455,7 +1469,7 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             args = get_args()
 
-            mlp_output, moe_loss, _, gate_info = self.mlp(layernorm_output, now_training_process=float(args.iteration) / args.train_iters)
+            mlp_output, moe_loss, _, gate_info = self.mlp(layernorm_output, now_training_process=float(args.iteration) / args.train_iters, enc_input_ids=enc_input_ids)
 
             my_probe = gate_info
 
@@ -1995,7 +2009,8 @@ class ParallelTransformer(MegatronModule):
                 retriever_output=None,
                 retriever_attn_mask=None,
                 inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None,
+                enc_input_ids=None):
         # hidden_states: [s, b, h]
 
         my_probe = {}
@@ -2109,6 +2124,9 @@ class ParallelTransformer(MegatronModule):
 
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
+
+                        if layer.num_experts > 1:
+                            forward_kwargs['enc_input_ids'] = enc_input_ids
 
                         hidden_states = layer(
                             hidden_states,

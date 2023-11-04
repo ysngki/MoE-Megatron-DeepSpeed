@@ -703,6 +703,44 @@ class TopKGate(torch.nn.Module):
 		return gate_output
 
 
+class HashRouter(torch.nn.Module):
+	def __init__(self, num_experts, voc_size, capacity_factor, eval_capacity_factor, min_capacity):
+		super().__init__()
+		self.hash_bin_map = torch.nn.Parameter(torch.LongTensor(voc_size).fill_(0), requires_grad=False)
+
+		import random
+		for i in range(voc_size):
+			self.hash_bin_map[i] = random.randrange(0, num_experts)
+
+		self.num_experts = num_experts
+		self.capacity_factor = torch.tensor(capacity_factor)
+		self.eval_capacity_factor = torch.tensor(eval_capacity_factor)
+		self.min_capacity = torch.tensor(min_capacity)
+	
+	def forward(self, input_ids):
+		now_capacity_factor = self.capacity_factor if self.training else self.eval_capacity_factor
+		capacity = torch.ceil((len(input_ids) / self.num_experts) * now_capacity_factor).to(torch.int64)
+		if capacity < self.min_capacity:
+			capacity = self.min_capacity.to(torch.int64)
+
+		indices1_s = self.hash_bin_map[input_ids]
+		mask1 = F.one_hot(indices1_s, num_classes=self.num_experts)
+
+		top_idx = _top_idx(mask1, capacity)
+		mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
+
+		all_valid_chosen_num = mask1.sum()
+		avg_valid_chosen_num = all_valid_chosen_num / mask1.shape[0]
+
+		combine_weights = mask1.float()
+
+		gate_info = {
+			"chosen_num": avg_valid_chosen_num,
+		}
+
+		return combine_weights, gate_info, top_idx
+
+
 uniform_map: Dict[torch.device, Callable] = {}
 gumbel_map: Dict[torch.device, Callable] = {}
 exp_selection_uniform_map: Dict[torch.device, Callable] = {}

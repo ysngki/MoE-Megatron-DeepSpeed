@@ -557,7 +557,8 @@ class TransformerLanguageModel(MegatronModule):
                     retriever_input=retriever_input,
                     retriever_attn_mask=retriever_attn_mask,
                     inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
+                    rotary_pos_emb=rotary_pos_emb,
+                    enc_input_ids=enc_input_ids)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
