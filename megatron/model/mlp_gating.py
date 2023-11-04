@@ -316,6 +316,158 @@ def topkgating(logits: Tensor, capacity_factor: float, min_capacity: int, in_k: 
 	return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx
 
 
+def baselayer_gating(logits: Tensor, capacity_factor: float, min_capacity: int, in_k: int, training_flag):
+	capacity = _capacity(logits, torch.tensor(capacity_factor), torch.tensor(min_capacity))
+
+	# just for logging
+	gates = F.softmax(logits, dim=1)
+	top1_p, _ = torch.max(gates, dim=1)
+	####
+
+	# use top-1 gating for evaluation
+	if not training_flag:
+		indices1_s = torch.argmax(logits, dim=1)
+		num_experts = int(logits.shape[1])
+		mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+		top_idx = _top_idx(mask1, capacity)
+		mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
+		mask1_float = mask1.float()
+		combine_weights = torch.sigmoid(logits) * mask1_float
+
+		gate_info = {}
+
+		return torch.tensor(0.0, device=logits.device, dtype=logits.dtype), combine_weights, None, None, gate_info, top_idx
+
+	# use linear assignment for training
+	from fairseq import libbase
+
+	ok = logits.isfinite()
+	if not ok.all():
+		# NaNs here can break the assignment algorithm
+		logits[~ok] = logits[ok].min()
+
+	assigment = libbase.balanced_assignment(logits.detach()) # (token_num)
+
+	assigment = assigment.reshape(logits.shape[1], logits.shape[0] // logits.shape[1]) # (expert_num, token_num / expert_num)
+	top_idx = assigment.t()[:capacity, :] # (capacity, expert num)
+
+	tensor_all_mask = torch.zeros_like(logits).scatter_(0, top_idx, 1)
+	combine_weights = torch.sigmoid(logits) * tensor_all_mask
+
+	gate_info = {
+		"top1_p": top1_p,
+	}
+
+	return torch.tensor(0.0, device=logits.device, dtype=logits.dtype), combine_weights, None, None, gate_info, top_idx
+
+
+def main_thresholdGating_prob_priority(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[
+	Tensor, Tensor, Tensor, Tensor]:
+	# everything is in fp32 in this function
+	gates = F.softmax(logits, dim=1)
+
+	top1_p, _ = torch.max(gates, dim=1)
+
+	### devloping ###
+	# one_expert_token_num = (top1_p > threshold).sum()
+	#################
+
+	capacity = _capacity(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
+
+	# Create a mask for 1st's expert per token
+	indices1_s = torch.argmax(gates, dim=1)
+	num_experts = int(gates.shape[1])
+	mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+	# gating decisions (no use)
+	exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+
+	# threshold
+	# gates_sorted, gates_indices = torch.sort(gates, dim=-1, descending=True)
+	# explore_top_k_num = max(min(int(2 * k), num_experts), 1)
+	explore_top_k_num = num_experts
+	gates_sorted, gates_indices = torch.topk(gates, dim=-1, k=explore_top_k_num, largest=True, sorted=True)
+
+	cum_sorted_gates = torch.cumsum(gates_sorted, dim=-1)
+	chosen_flag = (cum_sorted_gates - gates_sorted) < threshold  # (token num, explore_top_k_num)
+	chosen_flag[:, 0] = True  # at least select one expert
+	whole_chosen_indices = chosen_flag * (
+			gates_indices + 1)  # (token num, explore_top_k_num) \in (0, expert_num + 1), 0 means not choose
+	prob_importance = chosen_flag * gates_sorted
+
+	# get masks and capacity locations
+	explore_top_k_num = whole_chosen_indices.sum(dim=0).ne(0).sum()
+	whole_chosen_indices = whole_chosen_indices[:, :explore_top_k_num]  # (token num, explore_top_k_num)
+	prob_importance = prob_importance[:, :explore_top_k_num]
+
+	each_token_want_num = (whole_chosen_indices > 0).sum(dim=1)
+	avg_want_num = each_token_want_num.sum() / each_token_want_num.shape[0]
+
+	tensor_all_mask = torch.zeros((whole_chosen_indices.shape[0], num_experts + 1), device=whole_chosen_indices.device,
+								  dtype=whole_chosen_indices.dtype).scatter_(1, whole_chosen_indices,
+																			 prob_importance)[:,
+					  1:]  # (token num, expert_num)
+	token_num, expert_num = tensor_all_mask.shape
+
+	# random token selection (ignore position)
+	expert_received_num = (tensor_all_mask > 0).sum(dim=0)
+	receive_ratio = expert_received_num * 100 / token_num
+
+	top_idx = _top_idx(tensor_all_mask, capacity)  # (capacity, expert num)
+	new_mask1 = tensor_all_mask * torch.zeros_like(tensor_all_mask).scatter_(0, top_idx, 1)
+	tensor_all_mask = (new_mask1 > 0).int()
+	# -------------------------------------------
+
+	# tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0) - 1 # (token_num, expert_num)
+
+	expert_received_num = tensor_all_mask.sum(dim=0)
+	expert_not_full_ratio = (expert_received_num < capacity).sum() / expert_num
+
+	# tensor_all_locations = tensor_all_locations * tensor_all_mask # (token_num, expert_num)
+
+	# Compute l_aux  !!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+	me = torch.mean(gates, dim=0)
+
+	# ce = torch.sum(mask1.float(), dim=0)
+	# for i in range(1, dynamic_k):
+	#     ce += torch.sum(all_mask[i].float(), dim=0)
+	# ce /= ce.sum()
+
+	# ce = expert_received_num / expert_received_num.sum()
+
+	ce = torch.mean(mask1.float(), dim=0)
+
+	l_aux = torch.sum(me * ce) * num_experts
+	# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+
+	token_chosen_num = tensor_all_mask.sum(dim=-1)  # (token_num)
+	token_not_full_ratio = (token_chosen_num < each_token_want_num).sum() / token_num
+
+	all_valid_chosen_num = token_chosen_num.sum()
+	avg_valid_chosen_num = all_valid_chosen_num / token_num
+
+	tensor_all_mask_float = tensor_all_mask.float()
+	tensor_all_gates = gates * tensor_all_mask_float  # (s, e)
+
+	# all_locations_sc = _one_hot_to_float(tensor_all_locations, capacity) # (s, e, c)
+	# combine_weights = all_locations_sc * tensor_all_gates.unsqueeze(-1) # (s, e, c)
+
+	combine_weights = tensor_all_gates
+	# dispatch_mask = combine_weights.bool() # no used actually
+	dispatch_mask = None  # no used actually
+
+	gate_info = {
+		"top1_p": top1_p,
+		"chosen_num": avg_valid_chosen_num,
+		"token_not_full_ratio": token_not_full_ratio,
+		"expert_not_full_ratio": expert_not_full_ratio,
+		"want_num": avg_want_num,
+		"receive_ratio": receive_ratio
+	}
+	return l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx
+
+
 def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: int, k: int, threshold: float) -> Tuple[
 	Tensor, Tensor, Tensor, Tensor]:
 	# everything is in fp32 in this function
@@ -380,6 +532,12 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
 
 	# tensor_all_locations = tensor_all_locations * tensor_all_mask # (token_num, expert_num)
 
+	#######################################################################
+	### my simple loss
+	me = torch.mean(logits, dim=0)
+	l_aux = -me / num_experts
+	###
+
 	# Compute l_aux  !!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
 	me = torch.mean(gates, dim=0)
 
@@ -394,6 +552,7 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
 
 	l_aux = torch.sum(me * ce) * num_experts
 	# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
+	#######################################################################
 
 	token_chosen_num = tensor_all_mask.sum(dim=-1)  # (token_num)
 	token_not_full_ratio = (token_chosen_num < each_token_want_num).sum() / token_num
@@ -491,7 +650,14 @@ class TopKGate(torch.nn.Module):
 				use_tutel: bool = False,
 				in_logits: torch.Tensor = None,
 				now_training_process: float = None,
-				gating_function=None) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
+				gating_function=None,
+				use_base_layer: bool = False,
+				use_topk: bool =False,
+				use_threshold: bool =False) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
+
+		assert self.training == input.requires_grad, "Traning Flag Wrong in Router, YYH!"
+		if use_base_layer + use_topk + use_threshold != 1:
+			raise Exception("只能指定有且只有一个路由！")
 
 		if in_logits is None:
 			if self.wg.weight.dtype != torch.float32:
@@ -508,34 +674,31 @@ class TopKGate(torch.nn.Module):
 			logits = logits.reshape(logits.shape[0], -1, self.view_num)
 			logits = torch.max(logits, dim=-1)[0].contiguous()
 
-		gating_function = None
-		if gating_function is not None:
-			gate_output = gating_function(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-										  self.min_capacity, self.k, self.threshold)
-		else:
-			if self.k == 1:
-				# gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-				# 						 self.min_capacity, used_token,
-				# 						 self.noisy_gate_policy if self.training else None,
-				# 						 self.drop_tokens, self.use_rts, use_tutel,
-				# 						 placeholder_expert=self.placeholder_expert)
+		if use_base_layer:
+			gate_output = baselayer_gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+									 self.min_capacity, self.k, self.training)
+		elif use_topk:
+			# gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+			# 						 self.min_capacity, used_token,
+			# 						 self.noisy_gate_policy if self.training else None,
+			# 						 self.drop_tokens, self.use_rts, use_tutel,
+			# 						 placeholder_expert=self.placeholder_expert)
 
-				gate_output = topkgating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-										 self.min_capacity, self.k)
+			gate_output = topkgating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
+									 self.min_capacity, self.k)
 
-			else:
-				# gate_output = topkgating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
-				# 						 self.min_capacity, self.k)
-
-				if self.placeholder_expert:
-					raise Exception("Not supported yet!")
-					gate_output = plus_one_thresholdGating(logits,
-														   self.capacity_factor if self.training else self.eval_capacity_factor,
-														   self.min_capacity, self.k, self.threshold)
-				else:
-					gate_output = main_thresholdGating(logits,
+		elif use_threshold:
+			if self.placeholder_expert:
+				raise Exception("Not supported yet!")
+				gate_output = plus_one_thresholdGating(logits,
 													   self.capacity_factor if self.training else self.eval_capacity_factor,
 													   self.min_capacity, self.k, self.threshold)
+			else:
+				gate_output = main_thresholdGating(logits,
+												   self.capacity_factor if self.training else self.eval_capacity_factor,
+												   self.min_capacity, self.k, self.threshold)
+		else:
+			raise Exception("I should designate the router to use")
 
 		return gate_output
 

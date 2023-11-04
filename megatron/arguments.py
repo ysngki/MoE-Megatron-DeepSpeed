@@ -595,6 +595,12 @@ def _add_network_size_args(parser):
                            help='MoE Treshold (added by yyh)')
     group.add_argument('--sparse-mlp', action='store_true',
                        default=False, help='If set, use my spare mlp to replace the mlp in moe layer (added by yyh)')
+    group.add_argument('--use-base-layer', action='store_true',
+                       default=False, help='If set, use base layer gating (k is meaningless)')
+    group.add_argument('--use-topk', action='store_true',
+                       default=False, help='If set, use topk gating')
+    group.add_argument('--use-threshold', action='store_true',
+                       default=False, help='If set, use mine')
     group.add_argument('--placeholder-expert', action='store_true',
                        default=False, help='If set, add a virtual expert means no process (added by yyh)')
     group.add_argument('--gate-view-num', type=int, default=1,

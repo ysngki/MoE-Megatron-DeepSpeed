@@ -143,17 +143,21 @@ class SparseMLP(torch.nn.Module):
         self.gating_function = main_thresholdGating
 
     def forward(self, hidden_states, now_training_process):
+        args = get_args()
 
         sequence_len = hidden_states.shape[0]
         d_model = hidden_states.shape[-1]
 
         reshaped_input = hidden_states.reshape(-1, d_model)
 
-        l_aux, combine_weights, dispatch_mask, exp_counts, gate_info, top_idx = self.gate(reshaped_input,
+        l_aux, combine_weights, _, exp_counts, gate_info, top_idx = self.gate(reshaped_input,
                                                                                     None,
                                                                                     in_logits=None,
                                                                                     now_training_process=None,
-                                                                                    gating_function=self.gating_function)
+                                                                                    gating_function=None,
+                                                                                    use_base_layer=args.use_base_layer,
+                                                                                    use_topk=args.use_topk,
+                                                                                    use_threshold=args.use_threshold)
 
         expert_output, non_zero_ratio = self.experts(reshaped_input, combine_weights, top_idx)
 
