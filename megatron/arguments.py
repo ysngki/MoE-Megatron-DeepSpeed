@@ -654,6 +654,9 @@ def _add_network_size_args(parser):
     group.add_argument('--apply-layernorm-1p', action='store_true',
                        help='Adjust LayerNorm weights such that they are centered '
                        'around zero. This improves numerical stability.')
+    group.add_argument('--disable-mem-efficient-ln', action='store_false', 
+                       help='Disable the memory-efficient fused LayerNorm optimization '
+                       'introduced in https://github.com/NVIDIA/apex/pull/1715', dest='mem_efficient_ln')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
                        help='If set, use original BERT residula connection '
@@ -1067,7 +1070,8 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
-
+    group.add_argument('--universal-checkpoint', action='store_true',
+                        help='Loading a universal format checkpoint.')
     return parser
 
 
