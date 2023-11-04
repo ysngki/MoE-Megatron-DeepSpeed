@@ -656,8 +656,6 @@ class TopKGate(torch.nn.Module):
 				use_threshold: bool =False) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
 
 		assert self.training == input.requires_grad, "Traning Flag Wrong in Router, YYH!"
-		if use_base_layer + use_topk + use_threshold != 1:
-			raise Exception("只能指定有且只有一个路由！")
 
 		if in_logits is None:
 			if self.wg.weight.dtype != torch.float32:

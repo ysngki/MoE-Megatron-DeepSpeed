@@ -136,6 +136,8 @@ class SparseMLP(torch.nn.Module):
         self.use_topk = args.use_topk
         self.use_threshold = args.use_threshold
         self.use_hash_layer = args.use_hash_layer
+        if self.use_base_layer + self.use_topk + self.use_threshold + self.use_hash_layer != 1:
+            raise Exception("只能指定有且只有一个路由！")
 
         self.num_experts = num_experts
         self.num_local_experts = num_experts
