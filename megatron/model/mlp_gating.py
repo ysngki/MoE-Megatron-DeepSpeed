@@ -504,14 +504,15 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
 	# get masks and capacity locations
 	explore_top_k_num = whole_chosen_indices.sum(dim=0).ne(0).sum()
 	whole_chosen_indices = whole_chosen_indices[:, :explore_top_k_num]  # (token num, explore_top_k_num)
+	prob_importance = gates_sorted[:, :explore_top_k_num]
 
 	each_token_want_num = (whole_chosen_indices > 0).sum(dim=1)
 	avg_want_num = each_token_want_num.sum() / each_token_want_num.shape[0]
 
 	scatter_importance = torch.arange(explore_top_k_num, 0, -1, device=whole_chosen_indices.device).expand(
-		whole_chosen_indices.shape)  # (token num, explore_top_k_num)
+		whole_chosen_indices.shape)  + prob_importance # (token num, explore_top_k_num)
 	tensor_all_mask = torch.zeros((whole_chosen_indices.shape[0], num_experts + 1), device=whole_chosen_indices.device,
-								  dtype=whole_chosen_indices.dtype).scatter_(1, whole_chosen_indices,
+								  dtype=scatter_importance.dtype).scatter_(1, whole_chosen_indices,
 																			 scatter_importance)[:,
 					  1:]  # (token num, expert_num)
 	token_num, expert_num = tensor_all_mask.shape
