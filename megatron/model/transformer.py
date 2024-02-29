@@ -22,6 +22,9 @@ import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
 
+from torch.nn.parameter import Parameter
+# from .new_mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
+# from .fast_mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
 from .mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
 # from deepspeed.moe.sharded_moe import TopKGate
 
@@ -289,6 +292,45 @@ class ParallelMLP(MegatronModule):
             output = self.dense_h_to_small(output)
 
         return output, output_bias, non_zero_ratio
+
+# fast_mlp_gating requires passing ExpertMLPs instead of ParallelMLP to SparseMLP
+class ExpertMLPs(MegatronModule):
+    """MLP.
+
+    MLP will take the input with h hidden state, project it to 4*h
+    hidden dimension, perform nonlinear transformation, and project the
+    state back into h hidden dimension.
+    """
+
+    def __init__(self, config, moe=False, num_experts=1, enable_expert_tensor_parallelism=False):
+        super(ExpertMLPs, self).__init__()
+        args = get_args()
+
+        in_hidden_size = args.hidden_size
+        ffn_hidden_size = args.ffn_hidden_size
+
+        if moe:
+            ffn_hidden_size = args.moe_ffn_hidden_size
+
+        self.in_weight = Parameter(torch.randn(num_experts, in_hidden_size, ffn_hidden_size, dtype=config.params_dtype))
+        self.in_bias = Parameter(torch.randn(num_experts, 1, ffn_hidden_size, dtype=config.params_dtype))
+
+        self.out_weight = Parameter(torch.randn(num_experts, ffn_hidden_size, in_hidden_size, dtype=config.params_dtype))
+        self.out_bias = Parameter(torch.randn(num_experts, 1, in_hidden_size, dtype=config.params_dtype))
+
+        self.activation_func = openai_gelu
+
+    def forward(self, hidden_states):
+        # [s, b, 4hp]
+        intermediate_parallel = self.activation_func(hidden_states @ self.in_weight + self.in_bias)
+        
+        non_zero_ratio = (intermediate_parallel.view(-1) > 0).float().mean(dim=-1)
+
+        # [s, b, h]
+        output = intermediate_parallel @ self.out_weight + self.out_bias
+
+        return output, None, non_zero_ratio
+    
 
 class SwitchMLP(MegatronModule):
     """
@@ -1103,6 +1145,10 @@ class ParallelTransformerLayer(MegatronModule):
                                    ParallelMLP(config,
                                                moe=True,
                                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
+                                    # ExpertMLPs(config,
+                                    #            moe=True,
+                                    #            num_experts=self.num_experts,
+                                    #            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
                                    num_experts=self.num_experts,
                                    ep_size=args.moe_expert_parallel_size,
                                    k=args.topk,

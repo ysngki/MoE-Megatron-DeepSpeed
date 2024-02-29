@@ -9,6 +9,10 @@ import copy
 
 
 @torch.jit.script
+def _one_hot_to_float(x, num_classes):
+    return F.one_hot(x, num_classes=num_classes).float()
+
+@torch.jit.script
 def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> Tensor:
 	# gates has shape of SE
 	num_tokens = gates.shape[0]
@@ -89,29 +93,40 @@ class Experts(torch.nn.Module):
 	def __init__(self, expert, num_local_experts=1):
 		super(Experts, self).__init__()
 
-		self.yyh_local_experts = torch.nn.ModuleList([copy.deepcopy(expert) for _ in range(num_local_experts)])
+		self.expert = expert
+		self.num_experts = num_local_experts
 
 	def forward(self, inputs, inputs_weight, top_idx):
-		# inputs: (s, m), inputs_weight: (s, e)
-		expert_output = torch.zeros_like(inputs)
-		out_non_zero_ratio = None
-		for e_idx, expert in enumerate(self.yyh_local_experts):
-			token_idx = top_idx[:, e_idx]  # (capacity)
-			these_tokens = inputs[token_idx]  # (capacity, dim)
+		t_top_idx = top_idx.t() # (e, c)
+		inputs_weight = inputs_weight.t().type_as(inputs) # (e, c)
 
-			out = expert(these_tokens)
+		step_num = 1 # divide capacity into different part
+		whole_capacity = t_top_idx.shape[1]
+		step_capacity = whole_capacity // step_num
 
-			if type(out) is tuple:
-				if out_non_zero_ratio is None:
-					out_non_zero_ratio = out[2]
-				else:
-					out_non_zero_ratio += out[2]
+		output = torch.zeros_like(inputs)
 
-				out = out[0]  # Ignore the bias term for now
+		final_non_zero_ratio = 0.0
 
-			expert_output[token_idx] += out * inputs_weight[:, e_idx][token_idx].unsqueeze(-1).type_as(inputs)
+		for this_s in range(step_num):
+			if this_s == (step_num - 1):
+				this_top_idx = t_top_idx[:, this_s * step_capacity:]
+				this_inputs_weight = inputs_weight[:, this_s * step_capacity:]
+			else:
+				this_top_idx = t_top_idx[:, this_s * step_capacity: (this_s+1)*step_capacity]
+				this_inputs_weight = inputs_weight[:, this_s * step_capacity: (this_s+1)*step_capacity]
 
-		return expert_output, out_non_zero_ratio / len(self.yyh_local_experts)
+			dispatched_input = inputs.index_select(0, this_top_idx.reshape(-1)).reshape(*this_top_idx.shape, -1) # (e, c, m)
+			expert_output, _, out_non_zero_ratio = self.expert(dispatched_input)
+			final_non_zero_ratio += out_non_zero_ratio
+			h_dim = expert_output.shape[-1]
+
+			expert_output = (expert_output * this_inputs_weight.unsqueeze(-1)).reshape(-1, h_dim) # (e*c, m)
+			this_top_idx = this_top_idx.reshape(-1)
+
+			output.index_add_(0, index=this_top_idx, source=expert_output)
+		
+		return output, final_non_zero_ratio / step_num
 
 
 def top1gating(logits: Tensor,
@@ -266,11 +281,12 @@ def topkgating(logits: Tensor, capacity_factor: float, min_capacity: int, in_k: 
 	logits_except1 = logits_w_noise.masked_fill(mask1.bool(), float("-inf"))
 
 	if in_k > 1:
-		_, gates_indices = torch.topk(logits_except1, dim=-1, k=in_k-1, largest=True, sorted=True)
+		gates_sorted, gates_indices = torch.topk(logits_except1, dim=-1, k=in_k-1, largest=True, sorted=True)
 		whole_chosen_indices = torch.cat([indices1_s.unsqueeze(-1), gates_indices], dim=-1) # (token num, in_k)
+		whole_chosen_gates = torch.cat([top1_p.unsqueeze(-1), gates_sorted], dim=-1) # (token num, in_k)
 	else:
 		whole_chosen_indices = indices1_s.unsqueeze(-1)
-
+		whole_chosen_gates = top1_p.unsqueeze(-1)
 
 	scatter_importance = torch.arange(in_k, 0, -1, device=whole_chosen_indices.device).expand(
 		whole_chosen_indices.shape)  # (token num, in_k)
@@ -303,7 +319,8 @@ def topkgating(logits: Tensor, capacity_factor: float, min_capacity: int, in_k: 
 
 	tensor_all_mask_float = tensor_all_mask.float()
 	tensor_all_gates = gates * tensor_all_mask_float  # (s, e)
-	combine_weights = tensor_all_gates
+	# combine_weights = tensor_all_gates
+	combine_weights = torch.gather(tensor_all_gates, dim=0, index=top_idx) # (c, e)
 	dispatch_mask = None  # no used actually
 
 	gate_info = {
@@ -526,17 +543,15 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
 	tensor_all_mask = (new_mask1 > 0).int()
 	# -------------------------------------------
 
-	# tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0) - 1 # (token_num, expert_num)
+	# tensor_all_locations = torch.cumsum(tensor_all_mask, dim=0) # (token_num, expert_num)
 
 	expert_received_num = tensor_all_mask.sum(dim=0)
 	expert_not_full_ratio = (expert_received_num < capacity).sum() / expert_num
 
-	# tensor_all_locations = tensor_all_locations * tensor_all_mask # (token_num, expert_num)
-
 	#######################################################################
 	### my simple loss
-	me = torch.mean(logits, dim=0)
-	l_aux = -me / num_experts
+	# me = torch.mean(logits, dim=0)
+	# l_aux = -me / num_experts
 	###
 
 	# Compute l_aux  !!!!!!!!!!!!!!!!!!!!!!!!?????????????????????
@@ -563,13 +578,13 @@ def main_thresholdGating(logits: Tensor, capacity_factor: float, min_capacity: i
 
 	tensor_all_mask_float = tensor_all_mask.float()
 	tensor_all_gates = gates * tensor_all_mask_float  # (s, e)
+	combine_weights = torch.gather(tensor_all_gates, dim=0, index=top_idx) # (c, e)
 
-	# all_locations_sc = _one_hot_to_float(tensor_all_locations, capacity) # (s, e, c)
+	# all_locations_sc = _one_hot_to_float(tensor_all_locations, capacity + 1)[:, :, 1:] # (s, e, c) consume too much cuda memory
 	# combine_weights = all_locations_sc * tensor_all_gates.unsqueeze(-1) # (s, e, c)
 
-	combine_weights = tensor_all_gates
-	# dispatch_mask = combine_weights.bool() # no used actually
-	dispatch_mask = None  # no used actually
+	# combine_weights = tensor_all_gates
+	dispatch_mask = None
 
 	gate_info = {
 		"top1_p": top1_p,
