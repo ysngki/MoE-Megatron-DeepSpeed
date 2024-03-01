@@ -607,6 +607,8 @@ def _add_network_size_args(parser):
                        default=False, help='If set, add a virtual expert means no process (added by yyh)')
     group.add_argument('--gate-view-num', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers (added by yyh)')
+    group.add_argument('--no-moe-layer-num', type=int, default=0,
+                           help='if set to 0, the expert-interval works as usual; if set to 1, the second layer is treated to the first layer when deciding wether it is moe layer...')
     group.add_argument('--scale-moe', action='store_true',
                        help='scale the shape of moe layer to reduce communication cost. (added by yyh)')
     group.add_argument('--expert-interval', type=int, default=2,

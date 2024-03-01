@@ -23,7 +23,6 @@ from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
 
 from torch.nn.parameter import Parameter
-# from .new_mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
 # from .fast_mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
 from .mlp_gating import Experts, main_thresholdGating, TopKGate, HashRouter
 # from deepspeed.moe.sharded_moe import TopKGate
@@ -167,7 +166,7 @@ class SparseMLP(torch.nn.Module):
             l_aux, combine_weights, _, exp_counts, gate_info, top_idx = self.gate(reshaped_input,
                                                                                         None,
                                                                                         in_logits=None,
-                                                                                        now_training_process=None,
+                                                                                        now_training_process=now_training_process,
                                                                                         gating_function=None,
                                                                                         use_base_layer=self.use_base_layer,
                                                                                         use_topk=self.use_topk,
@@ -1900,7 +1899,7 @@ class ParallelTransformer(MegatronModule):
             self.layers = []
             for i in range(self.num_layers):
                 layer_num = i + 1 + offset
-                if layer_num % args.expert_interval == 0:
+                if (layer_num - args.no_moe_layer_num) % args.expert_interval == 0 and (layer_num > args.no_moe_layer_num):
                     n_e = num_experts[(layer_num-1) // args.expert_interval]
                 else:
                     n_e = 1
@@ -2197,8 +2196,10 @@ class ParallelTransformer(MegatronModule):
                                 moe_losses.append(moe_loss)
                                 args = get_args()
                                 # if this is moe layer, we need to save the probe;
+                                save_probe_flag = layer.num_experts > 1
                                 # if dense layer at specific position, we need to save the probe
-                                if layer.num_experts > 1 or (index + 1) % args.expert_interval == 0:
+                                save_probe_flag = save_probe_flag or ((index + 1 - args.no_moe_layer_num) % args.expert_interval == 0 and ((index + 1) > args.no_moe_layer_num))
+                                if save_probe_flag:
                                     if len(this_probe.keys()) > 0:
                                         all_layer_probes.append(this_probe)
 
